@@ -30,6 +30,9 @@ See [LICENSE](LICENSE).
 
 ## Current state
 
+<img width="934" height="632" alt="image" src="https://github.com/user-attachments/assets/4403ed86-1679-4808-afca-11d8b44292a1" />
+
+
 - `app`: reusable `winit` application runner and window configuration layer.
 - `core`: config, error types, context builder and handle slots.
 - `graphics`: lightweight projection helpers for pseudo-3D graphics rendered through the 2D backend.
