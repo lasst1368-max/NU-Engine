@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/nu-icon-white-512.png" alt="NU Engine logo" width="180" />
+</p>
+
 # NU - Not Unity
 
 > "Your project isn't bad,
@@ -10,6 +14,17 @@ Forget the GPU driver exists.
 Powered by Vulkan.
 
 Rust Vulkan renderer/runtime in progress, built with [ash](https://crates.io/crates/ash).
+
+## License
+
+NU Engine currently uses a custom staged source-available license:
+
+- Pre-1.0.0: source-visible and contribution-friendly, but not licensed for shipping Products
+- 1.0.0+: free for personal, open source, and commercial Products below $1M lifetime gross revenue
+- Above $1M: 5% of gross revenue above the threshold
+- Includes an explicit non-retroactive "Anti-Unity" trust guarantee for shipped Products
+
+See [LICENSE](LICENSE).
 
 ## Current state
 

@@ -1,0 +1,163 @@
+NU Engine License v0.1
+Copyright (c) 2026 Mannu
+
+This license applies to the NU Engine source code, assets, examples, documentation, and any
+other material distributed in this repository unless a file states otherwise.
+
+This is a source-available license, not an open source license.
+
+1. Definitions
+
+"NU Engine" or "Engine" means the software and materials in this repository.
+
+"Author" means Mannu, the original author and rights holder of NU Engine, unless rights are
+formally transferred in writing.
+
+"Stable Release" means a tagged NU Engine release with version number 1.0.0 or higher.
+
+"Pre-Release" means any NU Engine version before 1.0.0.
+
+"Product" means any game, application, tool, service, or other software built using NU Engine.
+
+"Gross Revenue" means all revenue directly attributable to a Product before taxes, platform fees,
+distribution fees, refunds, chargebacks, or other deductions.
+
+2. Pre-Release License Grant
+
+For all Pre-Releases of NU Engine, you may:
+
+- read, study, and learn from the source code
+- clone, fork, and modify the source code for evaluation, experimentation, and learning
+- build internal prototypes and tests
+- submit public pull requests and other public contributions
+
+For all Pre-Releases of NU Engine, you may not:
+
+- ship, distribute, sell, license, or otherwise release any Product built with NU Engine
+- use NU Engine to ship either commercial or non-commercial games or applications
+- represent any Pre-Release of NU Engine as production-ready
+
+Pre-Releases are unstable, may change without notice, and carry no warranty, support obligation,
+or compatibility promise. The Pre-Release stage ends when NU Engine 1.0.0 is released.
+
+3. Stable Release License Grant
+
+For Stable Releases of NU Engine, you may use NU Engine to build and ship Products under the
+following terms:
+
+Royalty-free use is granted forever for:
+
+- personal projects
+- open source projects
+- commercial Products with less than USD $1,000,000 in lifetime Gross Revenue per Product
+
+If a Product built with NU Engine reaches more than USD $1,000,000 in lifetime Gross Revenue, you
+owe the Author a royalty equal to 5% of Gross Revenue above USD $1,000,000 for that Product.
+
+Examples:
+
+- Gross Revenue of $900,000: no royalty owed
+- Gross Revenue of $1,000,000: no royalty owed
+- Gross Revenue of $1,500,000: royalty owed on $500,000 only
+
+Royalty reporting is self-reported unless otherwise agreed in writing. Larger studios may negotiate
+custom commercial terms directly with the Author.
+
+4. What You May Do
+
+Subject to this license, you may:
+
+- use NU Engine to build and ship Products when allowed by Section 2 or Section 3
+- modify NU Engine for use in your Product
+- build tools, extensions, and plugins on top of NU Engine
+- study the source code freely
+- contribute fixes, features, and improvements back to the project
+
+5. What You May Not Do
+
+You may not:
+
+- rebrand NU Engine as your own engine
+- remove or alter author attribution in a way that claims NU Engine is your own technology
+- fork NU Engine and publicly distribute it as a competing engine
+- sell, license, sublicense, or otherwise commercialize NU Engine itself as a standalone product
+- remove this license and redistribute NU Engine under a different license
+- imply endorsement by the Author without written permission
+
+Internal forks used only to build and ship your own Products are permitted, subject to the rest of
+this license. Public competing forks are not permitted.
+
+6. Core Modification and Contribution Rule
+
+If you modify the core of NU Engine for use beyond private evaluation or learning, those core
+modifications must be submitted back as a public pull request.
+
+This rule does not require the Author to merge your changes.
+
+This rule does not force you to open source your game, your game logic, your game content, your
+product-specific tools, or your product-specific scripts. It applies to the core NU Engine code.
+
+7. Contributions
+
+By submitting a contribution to NU Engine, you agree that:
+
+- the contribution is submitted as a public pull request unless the Author explicitly asks for a
+  different path
+- you keep credit for your contribution
+- the Author retains final merge and project-direction authority
+- accepted contributions are licensed under this same license
+
+No contributor license agreement is required for small fixes. The Author may request a separate CLA
+for larger contributions.
+
+8. Attribution
+
+You must not claim NU Engine is your own engine or core technology.
+
+For shipped Products built with Stable Releases, reasonable attribution is requested in credits,
+such as:
+
+"Powered by NU Engine"
+
+This attribution request is not intended to burden small projects, but removal of attribution may
+not be used to imply NU Engine was authored by you.
+
+9. Anti-Unity Trust Guarantee
+
+For any Product shipped using a Stable Release of NU Engine:
+
+- the royalty threshold of USD $1,000,000 for that Product is locked and may not be lowered
+- the 5% royalty rate above that threshold may not be increased retroactively for that Product
+- the license terms applicable to that shipped Product may not be retroactively changed in a way
+  that makes them more restrictive after you ship
+
+This clause is a binding promise intended to preserve developer trust.
+
+10. No Patent Grant
+
+No express or implied patent license is granted under this license.
+
+11. No Warranty
+
+NU ENGINE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+NON-INFRINGEMENT.
+
+12. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE AUTHOR SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES,
+LOSSES, OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT, OR OTHERWISE, ARISING FROM OR IN CONNECTION
+WITH NU ENGINE OR THE USE OF NU ENGINE.
+
+13. Termination
+
+If you violate this license, your rights under it terminate automatically.
+
+Termination does not remove any payment obligation that accrued before termination.
+
+14. Future Versions of This License
+
+The Author may publish future versions of this license for future versions of NU Engine.
+
+However, Section 9 controls shipped Products built with Stable Releases and prevents retroactive
+changes that would worsen terms for those shipped Products.
