@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176 214">
+  <defs>
+    <linearGradient id="ct" x1="20%" y1="0%" x2="80%" y2="100%">
+      <stop offset="0%" stop-color="#ff7055"/>
+      <stop offset="100%" stop-color="#cc1a10"/>
+    </linearGradient>
+    <linearGradient id="cl" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#880000"/>
+      <stop offset="100%" stop-color="#500000"/>
+    </linearGradient>
+    <linearGradient id="cr" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ee2010"/>
+      <stop offset="100%" stop-color="#aa0800"/>
+    </linearGradient>
+  </defs>
+  <polygon points="88,0 176,46 88,92 0,46" fill="url(#ct)"/>
+  <polygon points="0,46 88,92 88,210 0,164" fill="url(#cl)"/>
+  <polygon points="88,92 176,46 176,164 88,210" fill="url(#cr)"/>
+  <line x1="88" y1="0" x2="88" y2="92" stroke="#ffffff" stroke-width="1"/>
+  <polygon points="88,0 176,46 88,92 0,46" fill="none" stroke="#ffffff" stroke-width="1.5"/>
+  <line x1="0" y1="46" x2="88" y2="210" stroke="#ffffff" stroke-width="1"/>
+  <polygon points="0,46 88,92 88,210 0,164" fill="none" stroke="#ffffff" stroke-width="1.5"/>
+  <line x1="176" y1="46" x2="88" y2="210" stroke="#ffffff" stroke-width="1"/>
+  <polygon points="88,92 176,46 176,164 88,210" fill="none" stroke="#ffffff" stroke-width="1.5"/>
+</svg>

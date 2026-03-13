@@ -1,0 +1,76 @@
+# nu scene format v1
+# .nuscene
+
+[meta]
+engine = "nu"
+format = "nu_scene_v1"
+extension = ".nuscene"
+
+[scene]
+name = "test_scene"
+syntax = opengl
+# syntax selects the source profile translated into Vulkan in nu_scene_v1.
+
+[camera]
+position = 0.0, 5.0, 10.0
+target = 0.0, 0.0, 0.0
+fov = 60.0
+
+[light.key]
+type = point
+position = 5.0, 8.0, 3.0
+color = 1.0, 1.0, 1.0
+intensity = 1.0
+
+[light.fill]
+type = point
+position = -3.0, 4.0, -2.0
+color = 0.45, 0.48, 0.60
+intensity = 0.35
+
+[mesh.car]
+geometry = cube
+material = red_material
+transform.position = 0.0, 1.0, 0.0
+transform.rotation_degrees = 45.0, 0.0, 0.0
+transform.scale = 1.0, 1.0, 1.0
+
+# Built-in geometry currently supported by nu:
+# cube
+# plane
+# sphere
+#
+# Example imported mesh:
+# [mesh.crate]
+# geometry = obj
+# source = meshes/crate.obj
+# material = red_material
+# transform.position = 2.0, 1.0, 0.0
+# transform.rotation_degrees = 0.0, 0.0, 0.0
+# transform.scale = 1.0, 1.0, 1.0
+
+# Example parented mesh:
+# [mesh.wheel]
+# geometry = cube
+# material = wheel_material
+# parent = mesh.car
+# transform.position = 1.0, -0.5, 0.0
+# transform.rotation_degrees = 0.0, 0.0, 90.0
+# transform.scale = 0.5, 0.5, 0.2
+
+[environment]
+ambient_color = 0.1, 0.1, 0.15
+ambient_intensity = 0.3
+
+[material.red_material]
+shader.vertex = lit.vert
+shader.fragment = lit.frag
+color = 1.0, 0.0, 0.0
+roughness = 0.5
+albedo_texture = crate.png
+
+# [material.wheel_material]
+# shader.vertex = lit.vert
+# shader.fragment = lit.frag
+# color = 0.15, 0.15, 0.15
+# roughness = 0.7

@@ -1,0 +1,25 @@
+[package]
+name = "nu"
+version = "0.1.0"
+edition = "2024"
+description = "nu (Not Unity): high-power Vulkan boilerplate for 2D and 3D rendering with ash"
+license = "MIT"
+
+[lib]
+name = "nu"
+path = "src/lib.rs"
+
+[dependencies]
+ash = "0.38"
+ash-window = "0.13"
+api_macros = { path = "api_macros" }
+bitflags = "2.6"
+fontdue = "0.9"
+notify = "6.1"
+rfd = "0.15"
+shaderc = "0.10"
+tobj = "4.0"
+winit = "0.30"
+
+[build-dependencies]
+shaderc = "0.10"
