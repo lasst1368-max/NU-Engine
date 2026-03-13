@@ -10,6 +10,8 @@
 Discovered after writing an entire engine
 with the Y axis flipped, and nearly lost mind.
 
+*Seriously though, if anything is still flipped, tell me.*
+
 Forget the GPU driver exists.
 Powered by Vulkan.
 
