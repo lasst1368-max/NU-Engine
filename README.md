@@ -16,6 +16,7 @@ Forget the GPU driver exists.
 Powered by Vulkan.
 
 Rust Vulkan renderer/runtime in progress, built with [ash](https://crates.io/crates/ash).
+Not to be confused with [Nu By bryanedds)(https://github.com/bryanedds/Nu).
 
 ## License
 
