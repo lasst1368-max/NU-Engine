@@ -630,6 +630,52 @@ impl Default for MeshDraw3D {
     }
 }
 
+/// Ergonomic builder for spawning many instances of the same mesh in one call.
+///
+/// All instances share the same `mesh` geometry and `material` (same textures,
+/// roughness, metallic). The runtime batches them automatically into a single draw
+/// call on the GPU — 1000 cubes with the same material costs one `vkCmdDraw`.
+///
+/// # Example
+/// ```ignore
+/// let group = InstanceGroup::new(Mesh3D::cube())
+///     .push([0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0])
+///     .push([2.0, 0.0, 0.0], [0.0, 1.0, 0.0, 1.0]);
+/// frame.draw_instances(group);
+/// ```
+#[derive(Debug, Clone)]
+pub struct InstanceGroup {
+    /// Shared geometry for every instance in this group.
+    pub mesh: Mesh3D,
+    /// Shared material (textures, roughness, metallic, emissive) for every instance.
+    pub material: MeshMaterial3D,
+    /// Per-instance data: (center_xyz, size_xyz, rotation_radians_xyz, color_rgba).
+    pub instances: Vec<([f32; 3], [f32; 3], [f32; 3], [f32; 4])>,
+}
+
+impl InstanceGroup {
+    pub fn new(mesh: Mesh3D) -> Self {
+        Self { mesh, material: MeshMaterial3D::default(), instances: Vec::new() }
+    }
+
+    pub fn with_material(mut self, material: MeshMaterial3D) -> Self {
+        self.material = material;
+        self
+    }
+
+    /// Add an instance at `center` with uniform `scale` and default rotation/color.
+    pub fn push_simple(mut self, center: [f32; 3], scale: f32, color: [f32; 4]) -> Self {
+        self.instances.push((center, [scale, scale, scale], [0.0, 0.0, 0.0], color));
+        self
+    }
+
+    /// Add an instance with full transform control.
+    pub fn push(mut self, center: [f32; 3], size: [f32; 3], rotation_radians: [f32; 3], color: [f32; 4]) -> Self {
+        self.instances.push((center, size, rotation_radians, color));
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CubeDraw3D {
     pub center: [f32; 3],
@@ -772,6 +818,21 @@ impl SceneFrame {
 
     pub fn draw_mesh_3d(&mut self, draw: MeshDraw3D) {
         self.meshes_3d.push(draw);
+    }
+
+    /// Submit all instances in a group. The runtime automatically batches identical
+    /// geometry + material combinations into a single instanced draw call.
+    pub fn draw_instances(&mut self, group: InstanceGroup) {
+        for (center, size, rotation_radians, color) in group.instances {
+            self.meshes_3d.push(MeshDraw3D {
+                mesh: group.mesh.clone(),
+                center,
+                size,
+                rotation_radians,
+                color,
+                material: group.material.clone(),
+            });
+        }
     }
 
     pub fn draw_cube_3d(&mut self, draw: CubeDraw3D) {

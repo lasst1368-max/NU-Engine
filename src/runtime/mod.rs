@@ -43,10 +43,11 @@ const TEXT_2D_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text_2
 const INTER_FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
 const INITIAL_PRIMITIVE_CAPACITY: usize = 1024;
 const INITIAL_CUBE_VERTEX_CAPACITY: usize = 36;
+const INITIAL_CUBE_INSTANCE_CAPACITY: usize = 64;
 const INITIAL_TEXT_GLYPH_CAPACITY: usize = 2048;
 const SPHERE_LATITUDE_SEGMENTS: usize = 16;
 const SPHERE_LONGITUDE_SEGMENTS: usize = 24;
-const MAX_SCENE_CUBES: usize = 256;
+const MAX_SCENE_CUBES: usize = 4096;
 const MAX_MATERIAL_DESCRIPTOR_SETS: u32 = 256;
 const SHADOW_MAP_SIZE: u32 = 2048;
 const RUNTIME_SHADER_2D: ShaderHandle = ShaderHandle(2);
@@ -175,6 +176,9 @@ struct VulkanRuntime {
     cube_vertex_buffer: vk::Buffer,
     cube_vertex_buffer_memory: vk::DeviceMemory,
     cube_vertex_capacity: usize,
+    cube_instance_buffer: vk::Buffer,
+    cube_instance_buffer_memory: vk::DeviceMemory,
+    cube_instance_capacity: usize,
     cube_scene_buffer: vk::Buffer,
     cube_scene_buffer_memory: vk::DeviceMemory,
     cube_object_buffer: vk::Buffer,
@@ -232,39 +236,60 @@ struct TextGlyphInstance {
     uv_rect: [f32; 4],
 }
 
+/// Per-vertex geometry data, binding 0, VERTEX rate.  48 bytes.
+/// Shader locations: 0=position, 1=normal, 2=uv, 6=tangent.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct CubeVertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-    uv: [f32; 2],
-    albedo: [f32; 4],
-    object_index: u32,
-    material: [f32; 4],
-    /// Tangent vector in local space; w = handedness (±1). Default [1,0,0,1] when not computed.
-    tangent: [f32; 4],
+struct GeomVertex {
+    position: [f32; 3],  // location 0, offset  0
+    normal:   [f32; 3],  // location 1, offset 12
+    uv:       [f32; 2],  // location 2, offset 24
+    tangent:  [f32; 4],  // location 6, offset 32
 }
 
-impl CubeVertex {
-    /// Construct a vertex with the neutral default tangent `[1, 0, 0, 1]`.
-    fn with_default_tangent(
-        position: [f32; 3],
-        normal: [f32; 3],
-        uv: [f32; 2],
-        albedo: [f32; 4],
-        object_index: u32,
-        material: [f32; 4],
-    ) -> Self {
-        Self { position, normal, uv, albedo, object_index, material, tangent: [1.0, 0.0, 0.0, 1.0] }
-    }
-}
-
+/// Per-instance data, binding 1, INSTANCE rate.  36 bytes.
+/// Shader locations: 3=albedo, 4=object_index, 5=material.
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct MeshDrawBatch3D {
-    first_vertex: u32,
-    vertex_count: u32,
+struct InstanceVertex {
+    albedo:       [f32; 4],  // location 3, offset  0
+    object_index: u32,       // location 4, offset 16
+    material:     [f32; 4],  // location 5, offset 20
+}
+
+/// One instanced draw call: shared geometry + N instances sharing the same
+/// mesh type and material textures.
+#[derive(Clone)]
+struct InstancedBatch {
+    first_geom_vertex: u32,
+    geom_vertex_count: u32,
+    first_instance: u32,
+    instance_count: u32,
+    casts_shadow: bool,
     albedo_texture: Option<TextureHandle>,
     normal_texture: Option<TextureHandle>,
+}
+
+/// Identity key for a specific mesh shape, independent of per-instance data.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum MeshGeomKey {
+    Cube,
+    Plane,
+    Sphere,
+    Cylinder(u32, u32),
+    Torus(u32, u32),
+    Cone(u32, u32),
+    Capsule(u32, u32),
+    Icosphere(u32),
+    Custom(usize), // Arc pointer address used as identity
+}
+
+/// Key that groups meshes into a single instanced draw call.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct InstanceBatchKey {
+    geom:       MeshGeomKey,
+    albedo_tex: u32, // TextureHandle.0, or u32::MAX for None
+    normal_tex: u32, // TextureHandle.0, or u32::MAX for None
 }
 
 #[repr(C)]
@@ -571,31 +596,331 @@ fn build_text_glyph_instances(
     instances
 }
 
-fn build_mesh_vertices(
+// ---------------------------------------------------------------------------
+// Instanced scene builder — replaces the old flat build_mesh_vertices path.
+// ---------------------------------------------------------------------------
+
+/// Extract the batch key for a mesh draw.
+fn instance_batch_key(mesh: &MeshDraw3D) -> InstanceBatchKey {
+    let geom = match &mesh.mesh {
+        Mesh3D::Cube => MeshGeomKey::Cube,
+        Mesh3D::Plane => MeshGeomKey::Plane,
+        Mesh3D::Sphere => MeshGeomKey::Sphere,
+        Mesh3D::Cylinder { radial_segments, height_segments } => {
+            MeshGeomKey::Cylinder(*radial_segments, *height_segments)
+        }
+        Mesh3D::Torus { major_segments, minor_segments } => {
+            MeshGeomKey::Torus(*major_segments, *minor_segments)
+        }
+        Mesh3D::Cone { radial_segments, height_segments } => {
+            MeshGeomKey::Cone(*radial_segments, *height_segments)
+        }
+        Mesh3D::Capsule { radial_segments, cap_segments } => {
+            MeshGeomKey::Capsule(*radial_segments, *cap_segments)
+        }
+        Mesh3D::Icosphere { subdivisions } => MeshGeomKey::Icosphere(*subdivisions),
+        Mesh3D::Custom(arc) => {
+            MeshGeomKey::Custom(std::sync::Arc::as_ptr(arc) as usize)
+        }
+    };
+    InstanceBatchKey {
+        geom,
+        albedo_tex: mesh.material.albedo_texture.map_or(u32::MAX, |h| h.0),
+        normal_tex: mesh.material.normal_texture.map_or(u32::MAX, |h| h.0),
+    }
+}
+
+/// Convert one `MeshDraw3D` into a `GpuSceneCube` SSBO entry.
+fn mesh_to_gpu_cube(mesh: &MeshDraw3D) -> GpuSceneCube {
+    let axes = cube_axes(mesh.rotation_radians);
+    let thin_slab = is_thin_cube_slab(mesh);
+    let occlusion_weight = match mesh.mesh {
+        Mesh3D::Plane => 0.28,
+        Mesh3D::Cube if thin_slab => 0.14,
+        _ => 1.0,
+    };
+    GpuSceneCube {
+        center: [mesh.center[0], mesh.center[1], mesh.center[2], occlusion_weight],
+        half_extents: [mesh.size[0] * 0.5, mesh.size[1] * 0.5, mesh.size[2] * 0.5, 0.0],
+        axis_x: [
+            axes[0][0], axes[0][1], axes[0][2],
+            if matches!(mesh.mesh, Mesh3D::Plane | Mesh3D::Torus { .. }) || thin_slab {
+                0.0
+            } else {
+                1.0
+            },
+        ],
+        axis_y: [axes[1][0], axes[1][1], axes[1][2], 0.0],
+        axis_z: [axes[2][0], axes[2][1], axes[2][2], 0.0],
+    }
+}
+
+fn mesh_material_vertex_params(mesh: &MeshDraw3D) -> [f32; 4] {
+    [
+        mesh.material.roughness.clamp(0.0, 1.0),
+        mesh.material.metallic.clamp(0.0, 1.0),
+        mesh.material.emissive_intensity.max(0.0),
+        if mesh.material.normal_texture.is_some() { 1.0 } else { 0.0 },
+    ]
+}
+
+fn mesh_casts_live_shadow(mesh: &MeshDraw3D) -> bool {
+    !matches!(mesh.mesh, Mesh3D::Plane)
+}
+
+/// Compute a per-face tangent for a unit-cube face given its normal.
+fn cube_face_tangent(normal: [f32; 3]) -> [f32; 4] {
+    // For each axis-aligned face normal, choose a consistent tangent direction.
+    let t = if normal[1].abs() > 0.9 {
+        // top / bottom face — tangent along +X
+        [1.0_f32, 0.0, 0.0]
+    } else {
+        // all other faces — tangent along +Y projected perpendicular to normal
+        // For axis-aligned normals this simplifies to a fixed vector.
+        let candidate = [0.0_f32, 1.0, 0.0];
+        // Gram-Schmidt: remove normal component
+        let dot = candidate[0] * normal[0] + candidate[1] * normal[1] + candidate[2] * normal[2];
+        let t = [
+            candidate[0] - dot * normal[0],
+            candidate[1] - dot * normal[1],
+            candidate[2] - dot * normal[2],
+        ];
+        let len = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt().max(1e-6);
+        [t[0] / len, t[1] / len, t[2] / len]
+    };
+    [t[0], t[1], t[2], 1.0]
+}
+
+/// Emit 36 `GeomVertex` records for a unit cube (all 6 faces, no culling).
+fn generate_cube_geom(out: &mut Vec<GeomVertex>) {
+    let corners: [[f32; 3]; 8] = [
+        [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0,  1.0, -1.0], [-1.0,  1.0, -1.0],
+        [-1.0, -1.0,  1.0], [1.0, -1.0,  1.0], [1.0,  1.0,  1.0], [-1.0,  1.0,  1.0],
+    ];
+    let faces: [([usize; 4], [f32; 3]); 6] = [
+        ([4, 5, 6, 7], [ 0.0,  0.0,  1.0]),  // front  +Z
+        ([1, 0, 3, 2], [ 0.0,  0.0, -1.0]),  // back   -Z
+        ([0, 4, 7, 3], [-1.0,  0.0,  0.0]),  // left   -X
+        ([5, 1, 2, 6], [ 1.0,  0.0,  0.0]),  // right  +X
+        ([3, 7, 6, 2], [ 0.0,  1.0,  0.0]),  // top    +Y
+        ([0, 1, 5, 4], [ 0.0, -1.0,  0.0]),  // bottom -Y
+    ];
+    let quad_uvs = [[0.0_f32, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    // Two triangles per face: (0,1,2) and (0,2,3) in quad-vertex order.
+    let tri_order = [0usize, 1, 2, 0, 2, 3];
+
+    for (idx, normal) in &faces {
+        let tangent = cube_face_tangent(*normal);
+        for &qi in &tri_order {
+            out.push(GeomVertex {
+                position: corners[idx[qi]],
+                normal: *normal,
+                uv: quad_uvs[qi],
+                tangent,
+            });
+        }
+    }
+}
+
+/// Emit geometry for a unit plane (both faces, size handled by SSBO half_extents).
+fn generate_plane_geom(out: &mut Vec<GeomVertex>) {
+    let tangent = [1.0_f32, 0.0, 0.0, 1.0];
+    // Top face (+Y normal)
+    let verts_top = [
+        ([-1.0_f32, 0.0, -1.0], [0.0_f32, 1.0, 0.0], [0.0_f32, 0.0]),
+        ([ 1.0,     0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0]),
+        ([ 1.0,     0.0,  1.0], [0.0, 1.0, 0.0], [1.0, 1.0]),
+        ([-1.0,     0.0,  1.0], [0.0, 1.0, 0.0], [0.0, 1.0]),
+    ];
+    // Bottom face (-Y normal), reversed winding
+    let verts_bot = [
+        ([-1.0_f32, 0.0, -1.0], [0.0_f32, -1.0, 0.0], [0.0_f32, 0.0]),
+        ([-1.0,     0.0,  1.0], [0.0, -1.0, 0.0], [0.0, 1.0]),
+        ([ 1.0,     0.0,  1.0], [0.0, -1.0, 0.0], [1.0, 1.0]),
+        ([ 1.0,     0.0, -1.0], [0.0, -1.0, 0.0], [1.0, 0.0]),
+    ];
+    for (pos, norm, uv) in &verts_top[..3] {
+        out.push(GeomVertex { position: *pos, normal: *norm, uv: *uv, tangent });
+    }
+    out.push(GeomVertex { position: verts_top[0].0, normal: verts_top[0].1, uv: verts_top[0].2, tangent });
+    out.push(GeomVertex { position: verts_top[2].0, normal: verts_top[2].1, uv: verts_top[2].2, tangent });
+    out.push(GeomVertex { position: verts_top[3].0, normal: verts_top[3].1, uv: verts_top[3].2, tangent });
+    for (pos, norm, uv) in &verts_bot[..3] {
+        out.push(GeomVertex { position: *pos, normal: *norm, uv: *uv, tangent });
+    }
+    out.push(GeomVertex { position: verts_bot[0].0, normal: verts_bot[0].1, uv: verts_bot[0].2, tangent });
+    out.push(GeomVertex { position: verts_bot[2].0, normal: verts_bot[2].1, uv: verts_bot[2].2, tangent });
+    out.push(GeomVertex { position: verts_bot[3].0, normal: verts_bot[3].1, uv: verts_bot[3].2, tangent });
+}
+
+/// Emit geometry for a unit sphere.
+fn generate_sphere_geom(out: &mut Vec<GeomVertex>) {
+    for lat in 0..SPHERE_LATITUDE_SEGMENTS {
+        let v0 = lat as f32 / SPHERE_LATITUDE_SEGMENTS as f32;
+        let v1 = (lat + 1) as f32 / SPHERE_LATITUDE_SEGMENTS as f32;
+        let theta0 = (v0 * std::f32::consts::PI) - (std::f32::consts::PI * 0.5);
+        let theta1 = (v1 * std::f32::consts::PI) - (std::f32::consts::PI * 0.5);
+
+        for lon in 0..SPHERE_LONGITUDE_SEGMENTS {
+            let u0 = lon as f32 / SPHERE_LONGITUDE_SEGMENTS as f32;
+            let u1 = (lon + 1) as f32 / SPHERE_LONGITUDE_SEGMENTS as f32;
+            let phi0 = u0 * std::f32::consts::TAU;
+            let phi1 = u1 * std::f32::consts::TAU;
+
+            let p00 = sphere_point(theta0, phi0);
+            let p10 = sphere_point(theta0, phi1);
+            let p01 = sphere_point(theta1, phi0);
+            let p11 = sphere_point(theta1, phi1);
+
+            let default_tangent = [1.0_f32, 0.0, 0.0, 1.0];
+            out.extend_from_slice(&[
+                GeomVertex { position: p00, normal: p00, uv: [u0, v0], tangent: default_tangent },
+                GeomVertex { position: p10, normal: p10, uv: [u1, v0], tangent: default_tangent },
+                GeomVertex { position: p11, normal: p11, uv: [u1, v1], tangent: default_tangent },
+                GeomVertex { position: p00, normal: p00, uv: [u0, v0], tangent: default_tangent },
+                GeomVertex { position: p11, normal: p11, uv: [u1, v1], tangent: default_tangent },
+                GeomVertex { position: p01, normal: p01, uv: [u0, v1], tangent: default_tangent },
+            ]);
+        }
+    }
+}
+
+/// Generate geometry vertices for a given batch key, using `representative_mesh`
+/// only for custom/procedural types that need parameters.
+fn generate_geom_vertices(
+    out: &mut Vec<GeomVertex>,
+    key: &InstanceBatchKey,
+    representative_mesh: &MeshDraw3D,
+) {
+    match &key.geom {
+        MeshGeomKey::Cube => generate_cube_geom(out),
+        MeshGeomKey::Plane => generate_plane_geom(out),
+        MeshGeomKey::Sphere => generate_sphere_geom(out),
+        MeshGeomKey::Cylinder(rs, hs) => {
+            let asset = crate::scene::primitives::generate_cylinder("cylinder", *rs, *hs);
+            for v in &asset.vertices {
+                out.push(GeomVertex { position: v.position, normal: v.normal, uv: v.uv, tangent: v.tangent });
+            }
+        }
+        MeshGeomKey::Torus(ms, ns) => {
+            let asset = crate::scene::primitives::generate_torus("torus", *ms, *ns);
+            for v in &asset.vertices {
+                out.push(GeomVertex { position: v.position, normal: v.normal, uv: v.uv, tangent: v.tangent });
+            }
+        }
+        MeshGeomKey::Cone(rs, hs) => {
+            let asset = crate::scene::primitives::generate_cone("cone", *rs, *hs);
+            for v in &asset.vertices {
+                out.push(GeomVertex { position: v.position, normal: v.normal, uv: v.uv, tangent: v.tangent });
+            }
+        }
+        MeshGeomKey::Capsule(rs, cs) => {
+            let asset = crate::scene::primitives::generate_capsule("capsule", *rs, *cs);
+            for v in &asset.vertices {
+                out.push(GeomVertex { position: v.position, normal: v.normal, uv: v.uv, tangent: v.tangent });
+            }
+        }
+        MeshGeomKey::Icosphere(sub) => {
+            let asset = crate::scene::primitives::generate_icosphere("icosphere", *sub);
+            for v in &asset.vertices {
+                out.push(GeomVertex { position: v.position, normal: v.normal, uv: v.uv, tangent: v.tangent });
+            }
+        }
+        MeshGeomKey::Custom(_) => {
+            if let Mesh3D::Custom(arc) = &representative_mesh.mesh {
+                for v in &arc.vertices {
+                    out.push(GeomVertex { position: v.position, normal: v.normal, uv: v.uv, tangent: v.tangent });
+                }
+            }
+        }
+    }
+}
+
+/// Group `frame.meshes_3d()` by `InstanceBatchKey`, build geometry + instance buffers,
+/// and compute camera/lighting uniforms.  Returns everything needed for a frame.
+fn build_instanced_scene(
     frame: &SceneFrame,
     camera: Camera3D,
     lighting: LightingConfig,
     extent: vk::Extent2D,
     camera_jitter_ndc: [f32; 2],
 ) -> (
-    Vec<CubeVertex>,
-    Vec<MeshDrawBatch3D>,
-    Vec<MeshDrawBatch3D>,
+    Vec<GeomVertex>,
+    Vec<InstanceVertex>,
+    Vec<InstancedBatch>,
     CubeViewProjectionPushConstants,
     CubeSceneUniforms,
     Vec<GpuSceneCube>,
 ) {
-    let mut vertices = Vec::with_capacity(frame.meshes_3d().len() * 36);
-    let mut draw_batches = Vec::with_capacity(frame.meshes_3d().len());
-    let mut shadow_draw_batches = Vec::with_capacity(frame.meshes_3d().len());
-    let cubes = build_gpu_scene_cubes(frame.meshes_3d());
+    // --- Group meshes by batch key, preserving first-seen order ---
+    let mut key_order: Vec<InstanceBatchKey> = Vec::new();
+    let mut groups: std::collections::HashMap<InstanceBatchKey, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, mesh) in frame.meshes_3d().iter().enumerate() {
+        let key = instance_batch_key(mesh);
+        if !groups.contains_key(&key) {
+            key_order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(i);
+    }
+
+    let mut all_geom: Vec<GeomVertex> = Vec::new();
+    let mut all_instances: Vec<InstanceVertex> = Vec::new();
+    let mut batches: Vec<InstancedBatch> = Vec::new();
+    let mut gpu_cubes: Vec<GpuSceneCube> = Vec::new();
+
+    for key in &key_order {
+        let mesh_indices = &groups[key];
+        let first_mesh = &frame.meshes_3d()[mesh_indices[0]];
+
+        let first_geom = all_geom.len() as u32;
+        let first_instance = all_instances.len() as u32;
+
+        // Generate geometry once per unique (mesh-type × texture) combination.
+        generate_geom_vertices(&mut all_geom, key, first_mesh);
+        let geom_vertex_count = all_geom.len() as u32 - first_geom;
+
+        let mut casts_shadow = false;
+        for &mesh_idx in mesh_indices {
+            if gpu_cubes.len() >= MAX_SCENE_CUBES {
+                break;
+            }
+            let mesh = &frame.meshes_3d()[mesh_idx];
+            let object_index = gpu_cubes.len() as u32;
+            gpu_cubes.push(mesh_to_gpu_cube(mesh));
+            all_instances.push(InstanceVertex {
+                albedo: mesh.color,
+                object_index,
+                material: mesh_material_vertex_params(mesh),
+            });
+            if mesh_casts_live_shadow(mesh) {
+                casts_shadow = true;
+            }
+        }
+        let instance_count = all_instances.len() as u32 - first_instance;
+
+        if geom_vertex_count > 0 && instance_count > 0 {
+            batches.push(InstancedBatch {
+                first_geom_vertex: first_geom,
+                geom_vertex_count,
+                first_instance,
+                instance_count,
+                casts_shadow,
+                albedo_texture: first_mesh.material.albedo_texture,
+                normal_texture: first_mesh.material.normal_texture,
+            });
+        }
+    }
+
+    // --- Build camera / lighting uniforms (identical logic to the old path) ---
+    let shadow_casters: Vec<MeshDraw3D> = frame
+        .meshes_3d()
+        .iter()
+        .filter(|m| mesh_casts_live_shadow(m))
+        .cloned()
+        .collect();
     let shadow_view_projection = compute_directional_shadow_view_projection(
-        &frame
-            .meshes_3d()
-            .iter()
-            .filter(|mesh| mesh_casts_live_shadow(mesh))
-            .cloned()
-            .collect::<Vec<_>>(),
+        &shadow_casters,
         camera,
         lighting,
         lighting.shadows.live.max_distance,
@@ -606,55 +931,20 @@ fn build_mesh_vertices(
         extent.width as f32 / extent.height as f32
     };
 
-    for (mesh_index, mesh) in frame.meshes_3d().iter().cloned().enumerate() {
-        let first_vertex = vertices.len() as u32;
-        append_mesh_vertices(&mut vertices, mesh_index, &mesh, camera.position);
-        let vertex_count = vertices.len() as u32 - first_vertex;
-        if vertex_count > 0 {
-            let batch = MeshDrawBatch3D {
-                first_vertex,
-                vertex_count,
-                albedo_texture: mesh.material.albedo_texture,
-                normal_texture: mesh.material.normal_texture,
-            };
-            draw_batches.push(batch);
-            if mesh_casts_live_shadow(&mesh) {
-                shadow_draw_batches.push(batch);
-            }
-        }
-    }
-
     let mut point_light_positions = [[0.0; 4]; MAX_POINT_LIGHTS];
     let mut point_light_colors = [[0.0; 4]; MAX_POINT_LIGHTS];
     let mut point_light_shadow_flags = [0.0; 4];
     for index in 0..lighting.point_light_count.min(MAX_POINT_LIGHTS) {
         let light = lighting.point_lights[index];
-        point_light_positions[index] = [
-            light.position[0],
-            light.position[1],
-            light.position[2],
-            light.range,
-        ];
-        point_light_colors[index] = [
-            light.color[0],
-            light.color[1],
-            light.color[2],
-            light.intensity,
-        ];
-        point_light_shadow_flags[index] = if lighting.point_light_shadow_flags[index] {
-            1.0
-        } else {
-            0.0
-        };
+        point_light_positions[index] =
+            [light.position[0], light.position[1], light.position[2], light.range];
+        point_light_colors[index] =
+            [light.color[0], light.color[1], light.color[2], light.intensity];
+        point_light_shadow_flags[index] =
+            if lighting.point_light_shadow_flags[index] { 1.0 } else { 0.0 };
     }
 
-    // Pack spotlight data: 4 vec4s per spotlight.
-    // Layout per light (base = i * 4):
-    //   [base+0]: pos.xyz, range
-    //   [base+1]: dir.xyz, intensity
-    //   [base+2]: color.xyz, spot_count (only base+2 of light 0 carries the total count)
-    //   [base+3]: cos_inner, cos_outer, 0, 0
-    let mut spot_lights = [[0.0f32; 4]; 16];
+    let mut spot_lights = [[0.0_f32; 4]; 16];
     let spot_count = lighting.spot_light_count.min(crate::lighting::MAX_SPOT_LIGHTS);
     for i in 0..spot_count {
         let sl = &lighting.spot_lights[i];
@@ -664,13 +954,12 @@ fn build_mesh_vertices(
         spot_lights[base + 2] = [sl.color[0], sl.color[1], sl.color[2], spot_count as f32];
         spot_lights[base + 3] = [sl.inner_cos(), sl.outer_cos(), 0.0, 0.0];
     }
-    // Always write the count into slot [2].w even when there are no spotlights.
     spot_lights[2][3] = spot_count as f32;
 
     (
-        vertices,
-        draw_batches,
-        shadow_draw_batches,
+        all_geom,
+        all_instances,
+        batches,
         CubeViewProjectionPushConstants {
             view_projection: mul_mat4(
                 perspective_lh(
@@ -684,12 +973,7 @@ fn build_mesh_vertices(
             ),
         },
         CubeSceneUniforms {
-            camera_position: [
-                camera.position[0],
-                camera.position[1],
-                camera.position[2],
-                0.0,
-            ],
+            camera_position: [camera.position[0], camera.position[1], camera.position[2], 0.0],
             point_light_positions,
             point_light_colors,
             point_light_shadow_flags,
@@ -730,398 +1014,8 @@ fn build_mesh_vertices(
             shadow_view_projection,
             spot_lights,
         },
-        cubes,
+        gpu_cubes,
     )
-}
-
-fn mesh_casts_live_shadow(mesh: &MeshDraw3D) -> bool {
-    !matches!(mesh.mesh, Mesh3D::Plane)
-}
-
-fn append_mesh_vertices(
-    vertices: &mut Vec<CubeVertex>,
-    mesh_index: usize,
-    mesh: &MeshDraw3D,
-    camera_position: [f32; 3],
-) {
-    match &mesh.mesh {
-        Mesh3D::Cube => append_cube_mesh_vertices(vertices, mesh_index, mesh, camera_position),
-        Mesh3D::Plane => append_plane_mesh_vertices(vertices, mesh_index, mesh),
-        Mesh3D::Sphere => append_sphere_mesh_vertices(vertices, mesh_index, mesh, camera_position),
-        Mesh3D::Custom(asset) => append_custom_mesh_vertices(vertices, mesh_index, mesh, asset),
-        // Procedural primitives — generated on demand and routed through the custom path.
-        Mesh3D::Cylinder { radial_segments, height_segments } => {
-            let asset = crate::scene::primitives::generate_cylinder(
-                "cylinder", *radial_segments, *height_segments,
-            );
-            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
-        }
-        Mesh3D::Torus { major_segments, minor_segments } => {
-            let asset = crate::scene::primitives::generate_torus(
-                "torus", *major_segments, *minor_segments,
-            );
-            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
-        }
-        Mesh3D::Cone { radial_segments, height_segments } => {
-            let asset = crate::scene::primitives::generate_cone(
-                "cone", *radial_segments, *height_segments,
-            );
-            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
-        }
-        Mesh3D::Capsule { radial_segments, cap_segments } => {
-            let asset = crate::scene::primitives::generate_capsule(
-                "capsule", *radial_segments, *cap_segments,
-            );
-            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
-        }
-        Mesh3D::Icosphere { subdivisions } => {
-            let asset = crate::scene::primitives::generate_icosphere("icosphere", *subdivisions);
-            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
-        }
-    }
-}
-
-fn mesh_material_vertex_params(mesh: &MeshDraw3D) -> [f32; 4] {
-    [
-        mesh.material.roughness.clamp(0.0, 1.0),
-        mesh.material.metallic.clamp(0.0, 1.0),
-        // z = emissive intensity (0 = no emission)
-        mesh.material.emissive_intensity.max(0.0),
-        // w = normal map flag (>= 0.5 means a normal map is bound at set=3)
-        if mesh.material.normal_texture.is_some() { 1.0 } else { 0.0 },
-    ]
-}
-
-fn append_plane_mesh_vertices(
-    vertices: &mut Vec<CubeVertex>,
-    mesh_index: usize,
-    mesh: &MeshDraw3D,
-) {
-    let half = [mesh.size[0] * 0.5, mesh.size[1] * 0.5, mesh.size[2] * 0.5];
-    let local_normal = [0.0, 1.0, 0.0];
-
-    let p0 = [-half[0], 0.0, -half[2]];
-    let p1 = [half[0], 0.0, -half[2]];
-    let p2 = [half[0], 0.0, half[2]];
-    let p3 = [-half[0], 0.0, half[2]];
-    let uv0 = [0.0, 0.0];
-    let uv1 = [1.0, 0.0];
-    let uv2 = [1.0, 1.0];
-    let uv3 = [0.0, 1.0];
-
-    vertices.extend_from_slice(&[
-        CubeVertex {
-            position: p0,
-            normal: local_normal,
-            uv: uv0,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p1,
-            normal: local_normal,
-            uv: uv1,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p2,
-            normal: local_normal,
-            uv: uv2,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p0,
-            normal: local_normal,
-            uv: uv0,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p2,
-            normal: local_normal,
-            uv: uv2,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p3,
-            normal: local_normal,
-            uv: uv3,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p0,
-            normal: [0.0, -1.0, 0.0],
-            uv: uv0,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p3,
-            normal: [0.0, -1.0, 0.0],
-            uv: uv3,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p2,
-            normal: [0.0, -1.0, 0.0],
-            uv: uv2,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p0,
-            normal: [0.0, -1.0, 0.0],
-            uv: uv0,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p2,
-            normal: [0.0, -1.0, 0.0],
-            uv: uv2,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-        CubeVertex {
-            position: p1,
-            normal: [0.0, -1.0, 0.0],
-            uv: uv1,
-            albedo: mesh.color,
-            object_index: mesh_index as u32,
-            material: mesh_material_vertex_params(mesh),
-            tangent: [1.0, 0.0, 0.0, 1.0],
-        },
-    ]);
-}
-
-fn append_cube_mesh_vertices(
-    vertices: &mut Vec<CubeVertex>,
-    mesh_index: usize,
-    mesh: &MeshDraw3D,
-    camera_position: [f32; 3],
-) {
-    let half = [mesh.size[0] * 0.5, mesh.size[1] * 0.5, mesh.size[2] * 0.5];
-    let base_local_corners = [
-        [-1.0, -1.0, -1.0],
-        [1.0, -1.0, -1.0],
-        [1.0, 1.0, -1.0],
-        [-1.0, 1.0, -1.0],
-        [-1.0, -1.0, 1.0],
-        [1.0, -1.0, 1.0],
-        [1.0, 1.0, 1.0],
-        [-1.0, 1.0, 1.0],
-    ];
-    let world_corners = base_local_corners.map(|corner| {
-        let scaled = [
-            corner[0] * half[0],
-            corner[1] * half[1],
-            corner[2] * half[2],
-        ];
-        add3(rotate_vector_3d(scaled, mesh.rotation_radians), mesh.center)
-    });
-    let faces = [
-        ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
-        ([1, 0, 3, 2], [0.0, 0.0, -1.0]),
-        ([0, 4, 7, 3], [-1.0, 0.0, 0.0]),
-        ([5, 1, 2, 6], [1.0, 0.0, 0.0]),
-        ([3, 7, 6, 2], [0.0, 1.0, 0.0]),
-        ([0, 1, 5, 4], [0.0, -1.0, 0.0]),
-    ];
-
-    for (indices, normal) in faces {
-        let rotated_normal = normalize3(rotate_vector_3d(normal, mesh.rotation_radians));
-        let face_center = scale3(
-            add3(
-                add3(world_corners[indices[0]], world_corners[indices[1]]),
-                add3(world_corners[indices[2]], world_corners[indices[3]]),
-            ),
-            0.25,
-        );
-        let to_camera = normalize3(sub3(camera_position, face_center));
-        if dot3(rotated_normal, to_camera) <= 0.0 {
-            continue;
-        }
-
-        let p0 = base_local_corners[indices[0]];
-        let p1 = base_local_corners[indices[1]];
-        let p2 = base_local_corners[indices[2]];
-        let p3 = base_local_corners[indices[3]];
-        let uv0 = [0.0, 0.0];
-        let uv1 = [1.0, 0.0];
-        let uv2 = [1.0, 1.0];
-        let uv3 = [0.0, 1.0];
-        vertices.extend_from_slice(&[
-            CubeVertex {
-                position: p0,
-                normal,
-                uv: uv0,
-                albedo: mesh.color,
-                object_index: mesh_index as u32,
-                material: mesh_material_vertex_params(mesh),
-            },
-            CubeVertex {
-                position: p1,
-                normal,
-                uv: uv1,
-                albedo: mesh.color,
-                object_index: mesh_index as u32,
-                material: mesh_material_vertex_params(mesh),
-            },
-            CubeVertex {
-                position: p2,
-                normal,
-                uv: uv2,
-                albedo: mesh.color,
-                object_index: mesh_index as u32,
-                material: mesh_material_vertex_params(mesh),
-            },
-            CubeVertex {
-                position: p0,
-                normal,
-                uv: uv0,
-                albedo: mesh.color,
-                object_index: mesh_index as u32,
-                material: mesh_material_vertex_params(mesh),
-            },
-            CubeVertex {
-                position: p2,
-                normal,
-                uv: uv2,
-                albedo: mesh.color,
-                object_index: mesh_index as u32,
-                material: mesh_material_vertex_params(mesh),
-            },
-            CubeVertex {
-                position: p3,
-                normal,
-                uv: uv3,
-                albedo: mesh.color,
-                object_index: mesh_index as u32,
-                material: mesh_material_vertex_params(mesh),
-            },
-        ]);
-    }
-}
-
-fn append_sphere_mesh_vertices(
-    vertices: &mut Vec<CubeVertex>,
-    mesh_index: usize,
-    mesh: &MeshDraw3D,
-    _camera_position: [f32; 3],
-) {
-    for lat in 0..SPHERE_LATITUDE_SEGMENTS {
-        let v0 = lat as f32 / SPHERE_LATITUDE_SEGMENTS as f32;
-        let v1 = (lat + 1) as f32 / SPHERE_LATITUDE_SEGMENTS as f32;
-        let theta0 = (v0 * std::f32::consts::PI) - (std::f32::consts::PI * 0.5);
-        let theta1 = (v1 * std::f32::consts::PI) - (std::f32::consts::PI * 0.5);
-
-        for lon in 0..SPHERE_LONGITUDE_SEGMENTS {
-            let u0 = lon as f32 / SPHERE_LONGITUDE_SEGMENTS as f32;
-            let u1 = (lon + 1) as f32 / SPHERE_LONGITUDE_SEGMENTS as f32;
-            let phi0 = u0 * std::f32::consts::TAU;
-            let phi1 = u1 * std::f32::consts::TAU;
-
-            let p00 = sphere_point(theta0, phi0);
-            let p10 = sphere_point(theta0, phi1);
-            let p01 = sphere_point(theta1, phi0);
-            let p11 = sphere_point(theta1, phi1);
-
-            vertices.extend_from_slice(&[
-                CubeVertex {
-                    position: p00,
-                    normal: p00,
-                    uv: [u0, v0],
-                    albedo: mesh.color,
-                    object_index: mesh_index as u32,
-                    material: mesh_material_vertex_params(mesh),
-                },
-                CubeVertex {
-                    position: p10,
-                    normal: p10,
-                    uv: [u1, v0],
-                    albedo: mesh.color,
-                    object_index: mesh_index as u32,
-                    material: mesh_material_vertex_params(mesh),
-                },
-                CubeVertex {
-                    position: p11,
-                    normal: p11,
-                    uv: [u1, v1],
-                    albedo: mesh.color,
-                    object_index: mesh_index as u32,
-                    material: mesh_material_vertex_params(mesh),
-                },
-                CubeVertex {
-                    position: p00,
-                    normal: p00,
-                    uv: [u0, v0],
-                    albedo: mesh.color,
-                    object_index: mesh_index as u32,
-                    material: mesh_material_vertex_params(mesh),
-                },
-                CubeVertex {
-                    position: p11,
-                    normal: p11,
-                    uv: [u1, v1],
-                    albedo: mesh.color,
-                    object_index: mesh_index as u32,
-                    material: mesh_material_vertex_params(mesh),
-                },
-                CubeVertex {
-                    position: p01,
-                    normal: p01,
-                    uv: [u0, v1],
-                    albedo: mesh.color,
-                    object_index: mesh_index as u32,
-                    material: mesh_material_vertex_params(mesh),
-                },
-            ]);
-        }
-    }
-}
-
-fn append_custom_mesh_vertices(
-    vertices: &mut Vec<CubeVertex>,
-    mesh_index: usize,
-    mesh: &MeshDraw3D,
-    asset: &std::sync::Arc<crate::scene::MeshAsset3D>,
-) {
-    vertices.extend(asset.vertices.iter().map(|vertex| CubeVertex {
-        position: vertex.position,
-        normal: vertex.normal,
-        uv: vertex.uv,
-        albedo: mesh.color,
-        object_index: mesh_index as u32,
-        material: mesh_material_vertex_params(mesh),
-        tangent: vertex.tangent,
-    }));
 }
 
 impl<T> WindowApp for SceneApp<T>
@@ -1529,7 +1423,15 @@ impl VulkanRuntime {
             &instance,
             &device,
             physical_device,
-            (INITIAL_CUBE_VERTEX_CAPACITY * size_of::<CubeVertex>()) as vk::DeviceSize,
+            (INITIAL_CUBE_VERTEX_CAPACITY * size_of::<GeomVertex>()) as vk::DeviceSize,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let (cube_instance_buffer, cube_instance_buffer_memory) = create_buffer(
+            &instance,
+            &device,
+            physical_device,
+            (INITIAL_CUBE_INSTANCE_CAPACITY * size_of::<InstanceVertex>()) as vk::DeviceSize,
             vk::BufferUsageFlags::VERTEX_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
@@ -1604,6 +1506,9 @@ impl VulkanRuntime {
             cube_vertex_buffer,
             cube_vertex_buffer_memory,
             cube_vertex_capacity: INITIAL_CUBE_VERTEX_CAPACITY,
+            cube_instance_buffer,
+            cube_instance_buffer_memory,
+            cube_instance_capacity: INITIAL_CUBE_INSTANCE_CAPACITY,
             cube_scene_buffer,
             cube_scene_buffer_memory,
             cube_object_buffer,
@@ -1676,13 +1581,13 @@ impl VulkanRuntime {
             1
         };
         let (
-            cube_vertices,
-            cube_draw_batches,
-            shadow_draw_batches,
+            cube_geom_vertices,
+            cube_instance_vertices,
+            cube_batches,
             _cube_view_projection,
             _cube_scene_uniforms,
             gpu_cubes,
-        ) = build_mesh_vertices(
+        ) = build_instanced_scene(
             frame,
             scene_config.camera_3d,
             scene_config.lighting,
@@ -1693,8 +1598,10 @@ impl VulkanRuntime {
         self.upload_primitive_instances(&primitive_instances)?;
         self.ensure_text_glyph_capacity(text_glyph_instances.len())?;
         self.upload_text_glyph_instances(&text_glyph_instances)?;
-        self.ensure_cube_vertex_capacity(cube_vertices.len())?;
-        self.upload_cube_vertices(&cube_vertices)?;
+        self.ensure_cube_vertex_capacity(cube_geom_vertices.len())?;
+        self.upload_cube_vertices(&cube_geom_vertices)?;
+        self.ensure_cube_instance_capacity(cube_instance_vertices.len())?;
+        self.upload_cube_instances(&cube_instance_vertices)?;
         self.upload_cube_objects(&gpu_cubes)?;
         let screenshot_readback = if scene_config.screenshot_path.is_some() {
             Some(create_buffer(
@@ -1727,7 +1634,7 @@ impl VulkanRuntime {
                 } else {
                     [0.0, 0.0]
                 };
-                let (_, _, _, cube_view_projection, cube_scene_uniforms, _) = build_mesh_vertices(
+                let (_, _, _, cube_view_projection, cube_scene_uniforms, _) = build_instanced_scene(
                     frame,
                     scene_config.camera_3d,
                     scene_config.lighting,
@@ -1753,8 +1660,7 @@ impl VulkanRuntime {
                     scene_config,
                     primitive_instances.len() as u32,
                     text_glyph_instances.len() as u32,
-                    &cube_draw_batches,
-                    &shadow_draw_batches,
+                    &cube_batches,
                     cube_view_projection,
                     shadow_view_projection,
                     screenshot_readback.as_ref().map(|(buffer, _)| *buffer),
@@ -1842,7 +1748,7 @@ impl VulkanRuntime {
                 save_result?;
             }
         } else {
-            let (_, _, _, cube_view_projection, cube_scene_uniforms, _) = build_mesh_vertices(
+            let (_, _, _, cube_view_projection, cube_scene_uniforms, _) = build_instanced_scene(
                 frame,
                 scene_config.camera_3d,
                 scene_config.lighting,
@@ -1868,8 +1774,7 @@ impl VulkanRuntime {
                 scene_config,
                 primitive_instances.len() as u32,
                 text_glyph_instances.len() as u32,
-                &cube_draw_batches,
-                &shadow_draw_batches,
+                &cube_batches,
                 cube_view_projection,
                 shadow_view_projection,
                 None,
@@ -1924,8 +1829,7 @@ impl VulkanRuntime {
         scene_config: &SceneConfig,
         primitive_count: u32,
         text_glyph_count: u32,
-        cube_draw_batches: &[MeshDrawBatch3D],
-        shadow_draw_batches: &[MeshDrawBatch3D],
+        batches: &[InstancedBatch],
         cube_view_projection: CubeViewProjectionPushConstants,
         shadow_view_projection: CubeViewProjectionPushConstants,
         screenshot_readback_buffer: Option<vk::Buffer>,
@@ -1939,8 +1843,10 @@ impl VulkanRuntime {
             "begin_command_buffer",
         )?;
 
+        let shadow_batches: Vec<&InstancedBatch> =
+            batches.iter().filter(|b| b.casts_shadow).collect();
         if matches!(scene_config.lighting.shadows.mode, ShadowMode::Live)
-            && !shadow_draw_batches.is_empty()
+            && !shadow_batches.is_empty()
         {
             let shadow_clear_values = [vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
@@ -1978,8 +1884,8 @@ impl VulkanRuntime {
                         width: SHADOW_MAP_SIZE,
                         height: SHADOW_MAP_SIZE,
                     })];
-                let cube_vertex_buffers = [self.cube_vertex_buffer];
-                let offsets = [0_u64];
+                let shadow_vbufs = [self.cube_vertex_buffer, self.cube_instance_buffer];
+                let shadow_offsets = [0_u64, 0_u64];
                 self.device
                     .cmd_set_viewport(self.command_buffer, 0, &shadow_viewports);
                 self.device
@@ -2000,8 +1906,8 @@ impl VulkanRuntime {
                 self.device.cmd_bind_vertex_buffers(
                     self.command_buffer,
                     0,
-                    &cube_vertex_buffers,
-                    &offsets,
+                    &shadow_vbufs,
+                    &shadow_offsets,
                 );
                 self.device.cmd_push_constants(
                     self.command_buffer,
@@ -2010,13 +1916,13 @@ impl VulkanRuntime {
                     0,
                     cube_view_projection_as_bytes(&shadow_view_projection),
                 );
-                for batch in shadow_draw_batches {
+                for batch in &shadow_batches {
                     self.device.cmd_draw(
                         self.command_buffer,
-                        batch.vertex_count,
-                        1,
-                        batch.first_vertex,
-                        0,
+                        batch.geom_vertex_count,
+                        batch.instance_count,
+                        batch.first_geom_vertex,
+                        batch.first_instance,
                     );
                 }
                 self.device.cmd_end_render_pass(self.command_buffer);
@@ -2086,9 +1992,9 @@ impl VulkanRuntime {
                 .cmd_set_viewport(self.command_buffer, 0, &viewports);
             self.device
                 .cmd_set_scissor(self.command_buffer, 0, &scissors);
-            if !cube_draw_batches.is_empty() {
-                let cube_vertex_buffers = [self.cube_vertex_buffer];
-                let offsets = [0_u64];
+            if !batches.is_empty() {
+                let cube_vbufs = [self.cube_vertex_buffer, self.cube_instance_buffer];
+                let cube_offsets = [0_u64, 0_u64];
                 self.device.cmd_bind_pipeline(
                     self.command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -2113,8 +2019,8 @@ impl VulkanRuntime {
                 self.device.cmd_bind_vertex_buffers(
                     self.command_buffer,
                     0,
-                    &cube_vertex_buffers,
-                    &offsets,
+                    &cube_vbufs,
+                    &cube_offsets,
                 );
                 self.device.cmd_push_constants(
                     self.command_buffer,
@@ -2123,7 +2029,7 @@ impl VulkanRuntime {
                     0,
                     cube_view_projection_as_bytes(&cube_view_projection),
                 );
-                for batch in cube_draw_batches {
+                for batch in batches {
                     let material_descriptor_set =
                         self.ensure_material_descriptor_set_3d(batch.albedo_texture)?;
                     self.device.cmd_bind_descriptor_sets(
@@ -2136,10 +2042,10 @@ impl VulkanRuntime {
                     );
                     self.device.cmd_draw(
                         self.command_buffer,
-                        batch.vertex_count,
-                        1,
-                        batch.first_vertex,
-                        0,
+                        batch.geom_vertex_count,
+                        batch.instance_count,
+                        batch.first_geom_vertex,
+                        batch.first_instance,
                     );
                 }
             }
@@ -2392,7 +2298,7 @@ impl VulkanRuntime {
             &self.instance,
             &self.device,
             self.physical_device,
-            (new_capacity * size_of::<CubeVertex>()) as vk::DeviceSize,
+            (new_capacity * size_of::<GeomVertex>()) as vk::DeviceSize,
             vk::BufferUsageFlags::VERTEX_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
@@ -2413,7 +2319,40 @@ impl VulkanRuntime {
         Ok(())
     }
 
-    fn upload_cube_vertices(&self, vertices: &[CubeVertex]) -> Result<(), ApiError> {
+    fn ensure_cube_instance_capacity(&mut self, required: usize) -> Result<(), ApiError> {
+        if required <= self.cube_instance_capacity {
+            return Ok(());
+        }
+
+        let new_capacity = required
+            .next_power_of_two()
+            .max(INITIAL_CUBE_INSTANCE_CAPACITY);
+        let (buffer, memory) = create_buffer(
+            &self.instance,
+            &self.device,
+            self.physical_device,
+            (new_capacity * size_of::<InstanceVertex>()) as vk::DeviceSize,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+
+        unsafe {
+            if self.cube_instance_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.cube_instance_buffer, None);
+            }
+            if self.cube_instance_buffer_memory != vk::DeviceMemory::null() {
+                self.device
+                    .free_memory(self.cube_instance_buffer_memory, None);
+            }
+        }
+
+        self.cube_instance_buffer = buffer;
+        self.cube_instance_buffer_memory = memory;
+        self.cube_instance_capacity = new_capacity;
+        Ok(())
+    }
+
+    fn upload_cube_vertices(&self, vertices: &[GeomVertex]) -> Result<(), ApiError> {
         if vertices.is_empty() {
             return Ok(());
         }
@@ -2438,6 +2377,36 @@ impl VulkanRuntime {
                 upload_size as usize,
             );
             self.device.unmap_memory(self.cube_vertex_buffer_memory);
+        }
+
+        Ok(())
+    }
+
+    fn upload_cube_instances(&self, instances: &[InstanceVertex]) -> Result<(), ApiError> {
+        if instances.is_empty() {
+            return Ok(());
+        }
+
+        let upload_size = std::mem::size_of_val(instances) as vk::DeviceSize;
+        let mapped = vk_result(
+            unsafe {
+                self.device.map_memory(
+                    self.cube_instance_buffer_memory,
+                    0,
+                    upload_size,
+                    vk::MemoryMapFlags::empty(),
+                )
+            },
+            "map_memory(cube_instance_buffer)",
+        )?;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                instances.as_ptr().cast::<u8>(),
+                mapped.cast::<u8>(),
+                upload_size as usize,
+            );
+            self.device.unmap_memory(self.cube_instance_buffer_memory);
         }
 
         Ok(())
@@ -2740,6 +2709,9 @@ impl Drop for VulkanRuntime {
             self.device.destroy_buffer(self.cube_vertex_buffer, None);
             self.device
                 .free_memory(self.cube_vertex_buffer_memory, None);
+            self.device.destroy_buffer(self.cube_instance_buffer, None);
+            self.device
+                .free_memory(self.cube_instance_buffer_memory, None);
             self.device.destroy_buffer(self.cube_scene_buffer, None);
             self.device.free_memory(self.cube_scene_buffer_memory, None);
             self.device.destroy_buffer(self.cube_object_buffer, None);
@@ -3490,87 +3462,59 @@ fn compile_runtime_graphics_pipeline_3d(
         },
     );
 
+    // Binding 0 — GeomVertex (48 bytes), per-vertex.
+    // layout: position(0) @ 0, normal(1) @ 12, uv(2) @ 24, tangent(6) @ 32
+    let geom_stride = size_of::<GeomVertex>() as i32; // 48
+    // Binding 1 — InstanceVertex (36 bytes), per-instance (divisor = 1).
+    // layout: albedo(3) @ 0, object_index(4) @ 16, material(5) @ 20
+    let inst_stride = size_of::<InstanceVertex>() as i32; // 36
     let descriptor = GraphicsPipelineDescriptor {
         topology: vk::PrimitiveTopology::TRIANGLE_LIST,
         render_state: crate::syntax::DEPTH_TEST,
         vertex_attributes: vec![
-            VertexAttributeBinding {
-                index: 0,
-                binding: 0,
-                size: 3,
+            // --- binding 0: geometry ---
+            VertexAttributeBinding { // location 0: position (vec3)
+                index: 0, binding: 0, size: 3,
                 attrib_type: crate::syntax::VertexAttribType::Float32,
-                normalized: false,
-                stride: size_of::<CubeVertex>() as i32,
-                offset_bytes: 0,
-                enabled: true,
-                divisor: 0,
+                normalized: false, stride: geom_stride, offset_bytes: 0,
+                enabled: true, divisor: 0,
             },
-            VertexAttributeBinding {
-                index: 1,
-                binding: 0,
-                size: 3,
+            VertexAttributeBinding { // location 1: normal (vec3)
+                index: 1, binding: 0, size: 3,
                 attrib_type: crate::syntax::VertexAttribType::Float32,
-                normalized: false,
-                stride: size_of::<CubeVertex>() as i32,
-                offset_bytes: 12,
-                enabled: true,
-                divisor: 0,
+                normalized: false, stride: geom_stride, offset_bytes: 12,
+                enabled: true, divisor: 0,
             },
-            VertexAttributeBinding {
-                index: 2,
-                binding: 0,
-                size: 2,
+            VertexAttributeBinding { // location 2: uv (vec2)
+                index: 2, binding: 0, size: 2,
                 attrib_type: crate::syntax::VertexAttribType::Float32,
-                normalized: false,
-                stride: size_of::<CubeVertex>() as i32,
-                offset_bytes: 24,
-                enabled: true,
-                divisor: 0,
+                normalized: false, stride: geom_stride, offset_bytes: 24,
+                enabled: true, divisor: 0,
             },
-            VertexAttributeBinding {
-                index: 3,
-                binding: 0,
-                size: 4,
+            VertexAttributeBinding { // location 6: tangent (vec4)
+                index: 6, binding: 0, size: 4,
                 attrib_type: crate::syntax::VertexAttribType::Float32,
-                normalized: false,
-                stride: size_of::<CubeVertex>() as i32,
-                offset_bytes: 32,
-                enabled: true,
-                divisor: 0,
+                normalized: false, stride: geom_stride, offset_bytes: 32,
+                enabled: true, divisor: 0,
             },
-            VertexAttributeBinding {
-                index: 4,
-                binding: 0,
-                size: 1,
+            // --- binding 1: per-instance data ---
+            VertexAttributeBinding { // location 3: albedo (vec4)
+                index: 3, binding: 1, size: 4,
+                attrib_type: crate::syntax::VertexAttribType::Float32,
+                normalized: false, stride: inst_stride, offset_bytes: 0,
+                enabled: true, divisor: 1,
+            },
+            VertexAttributeBinding { // location 4: object_index (uint)
+                index: 4, binding: 1, size: 1,
                 attrib_type: crate::syntax::VertexAttribType::UnsignedInt,
-                normalized: false,
-                stride: size_of::<CubeVertex>() as i32,
-                offset_bytes: 48,
-                enabled: true,
-                divisor: 0,
+                normalized: false, stride: inst_stride, offset_bytes: 16,
+                enabled: true, divisor: 1,
             },
-            VertexAttributeBinding {
-                index: 5,
-                binding: 0,
-                size: 4,
+            VertexAttributeBinding { // location 5: material (vec4)
+                index: 5, binding: 1, size: 4,
                 attrib_type: crate::syntax::VertexAttribType::Float32,
-                normalized: false,
-                stride: size_of::<CubeVertex>() as i32,
-                offset_bytes: 52,
-                enabled: true,
-                divisor: 0,
-            },
-            // location 6: tangent (vec4, offset 68 = 52 + 16)
-            VertexAttributeBinding {
-                index: 6,
-                binding: 0,
-                size: 4,
-                attrib_type: crate::syntax::VertexAttribType::Float32,
-                normalized: false,
-                stride: size_of::<CubeVertex>() as i32,
-                offset_bytes: 68,
-                enabled: true,
-                divisor: 0,
+                normalized: false, stride: inst_stride, offset_bytes: 20,
+                enabled: true, divisor: 1,
             },
         ],
     };
@@ -4236,25 +4180,35 @@ fn create_shadow_pipeline_3d(
         .stage(vk::ShaderStageFlags::VERTEX)
         .module(vertex_module)
         .name(&entry_name)];
-    let vertex_binding_descriptions = [vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(size_of::<CubeVertex>() as u32)
-        .input_rate(vk::VertexInputRate::VERTEX)];
-    let vertex_attribute_descriptions = [
+    // Binding 0 — GeomVertex (48 bytes), per-vertex. Shadow only needs position.
+    // Binding 1 — InstanceVertex (36 bytes), per-instance. Shadow needs object_index.
+    let shadow_vertex_binding_descriptions = [
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<GeomVertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX),
+        vk::VertexInputBindingDescription::default()
+            .binding(1)
+            .stride(size_of::<InstanceVertex>() as u32)
+            .input_rate(vk::VertexInputRate::INSTANCE),
+    ];
+    let shadow_vertex_attribute_descriptions = [
+        // location 0: position (vec3), binding 0, offset 0
         vk::VertexInputAttributeDescription::default()
             .location(0)
             .binding(0)
             .format(vk::Format::R32G32B32_SFLOAT)
             .offset(0),
+        // location 4: object_index (uint), binding 1, offset 16
         vk::VertexInputAttributeDescription::default()
             .location(4)
-            .binding(0)
+            .binding(1)
             .format(vk::Format::R32_UINT)
-            .offset(48),
+            .offset(16),
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-        .vertex_binding_descriptions(&vertex_binding_descriptions)
-        .vertex_attribute_descriptions(&vertex_attribute_descriptions);
+        .vertex_binding_descriptions(&shadow_vertex_binding_descriptions)
+        .vertex_attribute_descriptions(&shadow_vertex_attribute_descriptions);
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
@@ -5891,7 +5845,7 @@ mod tests {
             material: Default::default(),
         });
 
-        let (vertices, _, _, _, _, _) = build_mesh_vertices(
+        let (geom, _, batches, _, _, _) = build_instanced_scene(
             &frame,
             Camera3D::default(),
             LightingConfig::default(),
@@ -5903,10 +5857,11 @@ mod tests {
         );
 
         assert!(
-            !vertices.is_empty(),
+            !geom.is_empty(),
             "cube vertex builder emitted no triangles"
         );
-        assert_eq!(vertices.len() % 3, 0);
+        assert_eq!(geom.len() % 3, 0);
+        assert_eq!(batches.len(), 1);
     }
 
     #[test]
@@ -5921,7 +5876,7 @@ mod tests {
             material: Default::default(),
         });
 
-        let (vertices, batches, _, _, _, _) = build_mesh_vertices(
+        let (geom, _, batches, _, _, _) = build_instanced_scene(
             &frame,
             Camera3D::default(),
             LightingConfig::default(),
@@ -5933,12 +5888,12 @@ mod tests {
         );
 
         assert!(
-            !vertices.is_empty(),
+            !geom.is_empty(),
             "sphere vertex builder emitted no triangles"
         );
-        assert_eq!(vertices.len() % 3, 0);
+        assert_eq!(geom.len() % 3, 0);
         assert_eq!(batches.len(), 1);
-        assert!(batches[0].vertex_count > 0);
+        assert!(batches[0].geom_vertex_count > 0);
     }
 
     #[test]
@@ -5953,7 +5908,7 @@ mod tests {
             ..MeshDraw3D::default()
         });
 
-        let (_, batches, _, _, _, _) = build_mesh_vertices(
+        let (_, _, batches, _, _, _) = build_instanced_scene(
             &frame,
             Camera3D::default(),
             LightingConfig::default(),
@@ -5966,7 +5921,7 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].albedo_texture, Some(TextureHandle(9)));
-        assert!(batches[0].vertex_count > 0);
+        assert!(batches[0].geom_vertex_count > 0);
     }
 
     #[test]

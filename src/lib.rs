@@ -99,10 +99,10 @@ pub use runtime::{
     resolve_sampled_texture_descriptor_writes, run_scene, update_sampled_texture_descriptor,
 };
 pub use scene::{
-    Camera2D, Camera3D, Canvas2D, CircleDraw, CubeDraw3D, DrawSpace, Frustum, LineDraw, Mesh3D,
-    MeshAsset3D, MeshDraw3D, MeshMaterial3D, MeshVertex3D, PrimitiveDraw, QuadDraw, RectDraw,
-    Scene, SceneConfig, SceneFrame, ScreenshotResolution, ShapeStyle, SphereDraw3D, SquareDraw,
-    TextAnchor, TextDraw,
+    Camera2D, Camera3D, Canvas2D, CircleDraw, CubeDraw3D, DrawSpace, Frustum, InstanceGroup,
+    LineDraw, Mesh3D, MeshAsset3D, MeshDraw3D, MeshMaterial3D, MeshVertex3D, PrimitiveDraw,
+    QuadDraw, RectDraw, Scene, SceneConfig, SceneFrame, ScreenshotResolution, ShapeStyle,
+    SphereDraw3D, SquareDraw, TextAnchor, TextDraw,
 };
 pub use scene::primitives::{
     generate_capsule, generate_cone, generate_cylinder, generate_icosphere, generate_torus,
