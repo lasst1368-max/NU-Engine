@@ -3,11 +3,12 @@ name = "nu"
 version = "0.1.0"
 edition = "2024"
 description = "nu (Not Unity): high-power Vulkan boilerplate for 2D and 3D rendering with ash"
-license = "MIT"
+license-file = "LICENSE"
 
 [lib]
 name = "nu"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 ash = "0.38"
@@ -15,6 +16,7 @@ ash-window = "0.13"
 api_macros = { path = "api_macros" }
 bitflags = "2.6"
 fontdue = "0.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
 notify = "6.1"
 rfd = "0.15"
 shaderc = "0.10"

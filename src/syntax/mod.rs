@@ -733,6 +733,14 @@ pub mod opengl {
             }
         }
 
+        pub fn reset_commands(&mut self) {
+            self.recorder.commands.clear();
+        }
+
+        pub fn command_count(&self) -> usize {
+            self.recorder.commands().len()
+        }
+
         pub fn profile(&self) -> BackendProfile {
             self.recorder.profile()
         }

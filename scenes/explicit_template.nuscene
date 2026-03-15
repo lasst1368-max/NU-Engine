@@ -34,6 +34,9 @@ material = red_material
 transform.position = 0.0, 1.0, 0.0
 transform.rotation_degrees = 45.0, 0.0, 0.0
 transform.scale = 1.0, 1.0, 1.0
+script.na = scripts/player_controller.na
+script.cpp = scripts/player_controller.cpp
+script.player_camera = true
 
 # Built-in geometry currently supported by nu:
 # cube
@@ -61,12 +64,16 @@ transform.scale = 1.0, 1.0, 1.0
 [environment]
 ambient_color = 0.1, 0.1, 0.15
 ambient_intensity = 0.3
+shadow_mode = live
+shadow_max_distance = 32.0
+shadow_filter_radius = 1.5
 
 [material.red_material]
 shader.vertex = lit.vert
 shader.fragment = lit.frag
 color = 1.0, 0.0, 0.0
 roughness = 0.5
+metallic = 0.0
 albedo_texture = crate.png
 
 # [material.wheel_material]
@@ -74,3 +81,4 @@ albedo_texture = crate.png
 # shader.fragment = lit.frag
 # color = 0.15, 0.15, 0.15
 # roughness = 0.7
+# metallic = 0.0

@@ -1,0 +1,20 @@
+entity CarController {
+    on_start() {
+        player_camera.attach(self);
+    }
+
+    on_update(delta_time) {
+        if input.key_down("W") {
+            self.move_forward(4.5 * delta_time);
+        }
+        if input.key_down("S") {
+            self.move_backward(4.5 * delta_time);
+        }
+        if input.key_down("A") {
+            self.move_left(4.5 * delta_time);
+        }
+        if input.key_down("D") {
+            self.move_right(4.5 * delta_time);
+        }
+    }
+}

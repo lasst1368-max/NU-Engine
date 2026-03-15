@@ -1,15 +1,18 @@
 use ash::khr::{surface, swapchain};
 use ash::{Device, Entry, Instance, vk};
 use fontdue::{Font, FontSettings, Metrics};
+use image::{ColorType, ImageFormat};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::Cursor;
 use std::mem::size_of;
+use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Instant;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use winit::window::Window;
+use winit::window::{CursorGrabMode, Window};
 
 use crate::app::{WindowApp, WindowConfig, run_window_app};
 use crate::core::{ApiConfig, ApiError};
@@ -20,10 +23,11 @@ use crate::executor::{
     VulkanGraphicsPipelineCompiler, apply_descriptor_writes,
     resolve_descriptor_writes_for_bindings,
 };
-use crate::lighting::LightingConfig;
+use crate::lighting::{LightingConfig, MAX_POINT_LIGHTS, ShadowMode};
 use crate::scene::{
     Camera2D, Camera3D, CircleDraw, DrawSpace, LineDraw, Mesh3D, MeshDraw3D, PrimitiveDraw,
-    QuadDraw, RectDraw, Scene, SceneConfig, SceneFrame, ShapeStyle, TextAnchor, TextDraw,
+    QuadDraw, RectDraw, Scene, SceneConfig, SceneFrame, ScreenshotResolution, ShapeStyle,
+    TextAnchor, TextDraw,
 };
 use crate::syntax::{BufferHandle, DescriptorSetHandle, ShaderHandle, TextureHandle};
 
@@ -33,6 +37,7 @@ const PRIMITIVE_2D_FRAG_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/primitive_2d.frag.spv"));
 const CUBE_3D_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cube_3d.vert.spv"));
 const CUBE_3D_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cube_3d.frag.spv"));
+const SHADOW_3D_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow_3d.vert.spv"));
 const TEXT_2D_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text_2d.vert.spv"));
 const TEXT_2D_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text_2d.frag.spv"));
 const INTER_FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
@@ -43,11 +48,13 @@ const SPHERE_LATITUDE_SEGMENTS: usize = 16;
 const SPHERE_LONGITUDE_SEGMENTS: usize = 24;
 const MAX_SCENE_CUBES: usize = 256;
 const MAX_MATERIAL_DESCRIPTOR_SETS: u32 = 256;
+const SHADOW_MAP_SIZE: u32 = 2048;
 const RUNTIME_SHADER_2D: ShaderHandle = ShaderHandle(2);
 const RUNTIME_SHADER_3D: ShaderHandle = ShaderHandle(1);
 const RUNTIME_SHADER_TEXT_2D: ShaderHandle = ShaderHandle(3);
 const RUNTIME_DESCRIPTOR_SET_3D: DescriptorSetHandle = DescriptorSetHandle(1);
 const RUNTIME_DESCRIPTOR_SET_TEXT_2D: DescriptorSetHandle = DescriptorSetHandle(2);
+const RUNTIME_DESCRIPTOR_SET_SHADOW_3D: DescriptorSetHandle = DescriptorSetHandle(3);
 const RUNTIME_DESCRIPTOR_SET_MATERIAL_BASE: u32 = 1024;
 const RUNTIME_BUFFER_CUBE_SCENE: BufferHandle = BufferHandle(1);
 const RUNTIME_BUFFER_CUBE_OBJECTS: BufferHandle = BufferHandle(2);
@@ -55,8 +62,10 @@ const RUNTIME_UNIFORM_CUBE_SCENE: &str = "CubeScene";
 const RUNTIME_STORAGE_CUBE_OBJECTS: &str = "CubeObjects";
 const RUNTIME_TEXTURE_WHITE: TextureHandle = TextureHandle(1);
 const RUNTIME_TEXTURE_FONT_ATLAS: TextureHandle = TextureHandle(2);
+const RUNTIME_TEXTURE_SHADOW_MAP: TextureHandle = TextureHandle(3);
 const RUNTIME_TEXTURE_SLOT_ALBEDO: u32 = 0;
 const RUNTIME_TEXTURE_SLOT_TEXT_ATLAS: u32 = 0;
+const RUNTIME_TEXTURE_SLOT_SHADOW_MAP: u32 = 0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SampledTextureDescriptorResources {
@@ -92,6 +101,7 @@ where
 
 struct SwapchainBundle {
     swapchain: vk::SwapchainKHR,
+    images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     extent: vk::Extent2D,
     format: vk::Format,
@@ -109,8 +119,10 @@ struct VulkanRuntime {
     present_queue: vk::Queue,
     swapchain_loader: swapchain::Device,
     swapchain: vk::SwapchainKHR,
+    swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain_extent: vk::Extent2D,
+    swapchain_format: vk::Format,
     msaa_samples: vk::SampleCountFlags,
     color_image: vk::Image,
     color_image_memory: vk::DeviceMemory,
@@ -120,6 +132,7 @@ struct VulkanRuntime {
     depth_image_memory: vk::DeviceMemory,
     depth_image_view: vk::ImageView,
     render_pass: vk::RenderPass,
+    screenshot_render_pass: vk::RenderPass,
     pipeline_layout_2d: vk::PipelineLayout,
     graphics_pipeline_2d: vk::Pipeline,
     descriptor_set_layout_text_2d: vk::DescriptorSetLayout,
@@ -130,11 +143,22 @@ struct VulkanRuntime {
     descriptor_set_layout_3d: vk::DescriptorSetLayout,
     descriptor_pool_3d: vk::DescriptorPool,
     descriptor_set_3d: vk::DescriptorSet,
+    shadow_descriptor_set_layout_3d: vk::DescriptorSetLayout,
+    shadow_descriptor_pool_3d: vk::DescriptorPool,
+    shadow_descriptor_set_3d: vk::DescriptorSet,
     material_descriptor_set_layout_3d: vk::DescriptorSetLayout,
     material_descriptor_pool_3d: vk::DescriptorPool,
     default_material_descriptor_set_3d: vk::DescriptorSet,
     pipeline_layout_3d: vk::PipelineLayout,
     graphics_pipeline_3d: vk::Pipeline,
+    shadow_render_pass: vk::RenderPass,
+    shadow_pipeline_layout: vk::PipelineLayout,
+    shadow_graphics_pipeline: vk::Pipeline,
+    shadow_map_image: vk::Image,
+    shadow_map_memory: vk::DeviceMemory,
+    shadow_map_view: vk::ImageView,
+    shadow_map_sampler: vk::Sampler,
+    shadow_framebuffer: vk::Framebuffer,
     executor_resources: ExecutorResources,
     graphics_pipeline_cache: GraphicsPipelineCache,
     pipeline_compiler: VulkanGraphicsPipelineCompiler,
@@ -169,6 +193,23 @@ struct VulkanRuntime {
     in_flight_fence: vk::Fence,
 }
 
+#[allow(dead_code)]
+struct ScreenshotRenderTarget {
+    extent: vk::Extent2D,
+    framebuffer: vk::Framebuffer,
+    color_image: vk::Image,
+    color_image_memory: vk::DeviceMemory,
+    color_image_view: vk::ImageView,
+    resolve_image: vk::Image,
+    resolve_image_memory: vk::DeviceMemory,
+    resolve_image_view: vk::ImageView,
+    depth_image: vk::Image,
+    depth_image_memory: vk::DeviceMemory,
+    depth_image_view: vk::ImageView,
+    readback_buffer: vk::Buffer,
+    readback_memory: vk::DeviceMemory,
+}
+
 enum DrawFrameResult {
     Drawn,
     NeedsResize,
@@ -199,6 +240,23 @@ struct CubeVertex {
     uv: [f32; 2],
     albedo: [f32; 4],
     object_index: u32,
+    material: [f32; 4],
+    /// Tangent vector in local space; w = handedness (±1). Default [1,0,0,1] when not computed.
+    tangent: [f32; 4],
+}
+
+impl CubeVertex {
+    /// Construct a vertex with the neutral default tangent `[1, 0, 0, 1]`.
+    fn with_default_tangent(
+        position: [f32; 3],
+        normal: [f32; 3],
+        uv: [f32; 2],
+        albedo: [f32; 4],
+        object_index: u32,
+        material: [f32; 4],
+    ) -> Self {
+        Self { position, normal, uv, albedo, object_index, material, tangent: [1.0, 0.0, 0.0, 1.0] }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -206,6 +264,7 @@ struct MeshDrawBatch3D {
     first_vertex: u32,
     vertex_count: u32,
     albedo_texture: Option<TextureHandle>,
+    normal_texture: Option<TextureHandle>,
 }
 
 #[repr(C)]
@@ -218,13 +277,18 @@ struct CubeViewProjectionPushConstants {
 #[derive(Clone, Copy)]
 struct CubeSceneUniforms {
     camera_position: [f32; 4],
-    light_position: [f32; 4],
-    light_color: [f32; 4],
+    point_light_positions: [[f32; 4]; MAX_POINT_LIGHTS],
+    point_light_colors: [[f32; 4]; MAX_POINT_LIGHTS],
+    point_light_shadow_flags: [f32; 4],
     ambient_color: [f32; 4],
     fill_direction: [f32; 4],
     fill_color: [f32; 4],
     material: [f32; 4],
     shadow_params: [f32; 4],
+    shadow_view_projection: [[f32; 4]; 4],
+    /// Spotlight data: 4 vec4s per light × 4 lights = 16 vec4s.
+    /// Per light layout: [pos.xyz, range], [dir.xyz, intensity], [color.xyz, count], [cos_inner, cos_outer, 0, 0]
+    spot_lights: [[f32; 4]; 16],
 }
 
 #[repr(C)]
@@ -512,8 +576,10 @@ fn build_mesh_vertices(
     camera: Camera3D,
     lighting: LightingConfig,
     extent: vk::Extent2D,
+    camera_jitter_ndc: [f32; 2],
 ) -> (
     Vec<CubeVertex>,
+    Vec<MeshDrawBatch3D>,
     Vec<MeshDrawBatch3D>,
     CubeViewProjectionPushConstants,
     CubeSceneUniforms,
@@ -521,7 +587,19 @@ fn build_mesh_vertices(
 ) {
     let mut vertices = Vec::with_capacity(frame.meshes_3d().len() * 36);
     let mut draw_batches = Vec::with_capacity(frame.meshes_3d().len());
+    let mut shadow_draw_batches = Vec::with_capacity(frame.meshes_3d().len());
     let cubes = build_gpu_scene_cubes(frame.meshes_3d());
+    let shadow_view_projection = compute_directional_shadow_view_projection(
+        &frame
+            .meshes_3d()
+            .iter()
+            .filter(|mesh| mesh_casts_live_shadow(mesh))
+            .cloned()
+            .collect::<Vec<_>>(),
+        camera,
+        lighting,
+        lighting.shadows.live.max_distance,
+    );
     let aspect = if extent.height == 0 {
         1.0
     } else {
@@ -533,17 +611,66 @@ fn build_mesh_vertices(
         append_mesh_vertices(&mut vertices, mesh_index, &mesh, camera.position);
         let vertex_count = vertices.len() as u32 - first_vertex;
         if vertex_count > 0 {
-            draw_batches.push(MeshDrawBatch3D {
+            let batch = MeshDrawBatch3D {
                 first_vertex,
                 vertex_count,
                 albedo_texture: mesh.material.albedo_texture,
-            });
+                normal_texture: mesh.material.normal_texture,
+            };
+            draw_batches.push(batch);
+            if mesh_casts_live_shadow(&mesh) {
+                shadow_draw_batches.push(batch);
+            }
         }
     }
+
+    let mut point_light_positions = [[0.0; 4]; MAX_POINT_LIGHTS];
+    let mut point_light_colors = [[0.0; 4]; MAX_POINT_LIGHTS];
+    let mut point_light_shadow_flags = [0.0; 4];
+    for index in 0..lighting.point_light_count.min(MAX_POINT_LIGHTS) {
+        let light = lighting.point_lights[index];
+        point_light_positions[index] = [
+            light.position[0],
+            light.position[1],
+            light.position[2],
+            light.range,
+        ];
+        point_light_colors[index] = [
+            light.color[0],
+            light.color[1],
+            light.color[2],
+            light.intensity,
+        ];
+        point_light_shadow_flags[index] = if lighting.point_light_shadow_flags[index] {
+            1.0
+        } else {
+            0.0
+        };
+    }
+
+    // Pack spotlight data: 4 vec4s per spotlight.
+    // Layout per light (base = i * 4):
+    //   [base+0]: pos.xyz, range
+    //   [base+1]: dir.xyz, intensity
+    //   [base+2]: color.xyz, spot_count (only base+2 of light 0 carries the total count)
+    //   [base+3]: cos_inner, cos_outer, 0, 0
+    let mut spot_lights = [[0.0f32; 4]; 16];
+    let spot_count = lighting.spot_light_count.min(crate::lighting::MAX_SPOT_LIGHTS);
+    for i in 0..spot_count {
+        let sl = &lighting.spot_lights[i];
+        let base = i * 4;
+        spot_lights[base]     = [sl.position[0], sl.position[1], sl.position[2], sl.range];
+        spot_lights[base + 1] = [sl.direction[0], sl.direction[1], sl.direction[2], sl.intensity];
+        spot_lights[base + 2] = [sl.color[0], sl.color[1], sl.color[2], spot_count as f32];
+        spot_lights[base + 3] = [sl.inner_cos(), sl.outer_cos(), 0.0, 0.0];
+    }
+    // Always write the count into slot [2].w even when there are no spotlights.
+    spot_lights[2][3] = spot_count as f32;
 
     (
         vertices,
         draw_batches,
+        shadow_draw_batches,
         CubeViewProjectionPushConstants {
             view_projection: mul_mat4(
                 perspective_lh(
@@ -551,6 +678,7 @@ fn build_mesh_vertices(
                     aspect,
                     camera.near_clip,
                     camera.far_clip,
+                    camera_jitter_ndc,
                 ),
                 look_at_lh(camera.position, camera.target, camera.up),
             ),
@@ -562,18 +690,9 @@ fn build_mesh_vertices(
                 camera.position[2],
                 0.0,
             ],
-            light_position: [
-                lighting.point_light.position[0],
-                lighting.point_light.position[1],
-                lighting.point_light.position[2],
-                lighting.point_light.range,
-            ],
-            light_color: [
-                lighting.point_light.color[0],
-                lighting.point_light.color[1],
-                lighting.point_light.color[2],
-                lighting.point_light.intensity,
-            ],
+            point_light_positions,
+            point_light_colors,
+            point_light_shadow_flags,
             ambient_color: [
                 lighting.ambient_color[0],
                 lighting.ambient_color[1],
@@ -590,23 +709,33 @@ fn build_mesh_vertices(
                 lighting.fill_light.color[0],
                 lighting.fill_light.color[1],
                 lighting.fill_light.color[2],
-                0.0,
+                lighting.point_light_count.min(MAX_POINT_LIGHTS) as f32,
             ],
             material: [
                 lighting.specular_strength,
                 lighting.shininess,
                 frame.meshes_3d().len() as f32,
-                0.0,
+                0.78,
             ],
             shadow_params: [
-                lighting.shadows.minimum_visibility,
+                if matches!(lighting.shadows.mode, ShadowMode::Live) {
+                    lighting.shadows.minimum_visibility
+                } else {
+                    1.0
+                },
                 lighting.shadows.bias,
-                lighting.shadows.point_light_radius,
-                lighting.shadows.directional_spread,
+                1.0 / SHADOW_MAP_SIZE as f32,
+                lighting.shadows.live.filter_radius.max(0.5),
             ],
+            shadow_view_projection,
+            spot_lights,
         },
         cubes,
     )
+}
+
+fn mesh_casts_live_shadow(mesh: &MeshDraw3D) -> bool {
+    !matches!(mesh.mesh, Mesh3D::Plane)
 }
 
 fn append_mesh_vertices(
@@ -617,25 +746,59 @@ fn append_mesh_vertices(
 ) {
     match &mesh.mesh {
         Mesh3D::Cube => append_cube_mesh_vertices(vertices, mesh_index, mesh, camera_position),
-        Mesh3D::Plane => append_plane_mesh_vertices(vertices, mesh_index, mesh, camera_position),
+        Mesh3D::Plane => append_plane_mesh_vertices(vertices, mesh_index, mesh),
         Mesh3D::Sphere => append_sphere_mesh_vertices(vertices, mesh_index, mesh, camera_position),
         Mesh3D::Custom(asset) => append_custom_mesh_vertices(vertices, mesh_index, mesh, asset),
+        // Procedural primitives — generated on demand and routed through the custom path.
+        Mesh3D::Cylinder { radial_segments, height_segments } => {
+            let asset = crate::scene::primitives::generate_cylinder(
+                "cylinder", *radial_segments, *height_segments,
+            );
+            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
+        }
+        Mesh3D::Torus { major_segments, minor_segments } => {
+            let asset = crate::scene::primitives::generate_torus(
+                "torus", *major_segments, *minor_segments,
+            );
+            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
+        }
+        Mesh3D::Cone { radial_segments, height_segments } => {
+            let asset = crate::scene::primitives::generate_cone(
+                "cone", *radial_segments, *height_segments,
+            );
+            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
+        }
+        Mesh3D::Capsule { radial_segments, cap_segments } => {
+            let asset = crate::scene::primitives::generate_capsule(
+                "capsule", *radial_segments, *cap_segments,
+            );
+            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
+        }
+        Mesh3D::Icosphere { subdivisions } => {
+            let asset = crate::scene::primitives::generate_icosphere("icosphere", *subdivisions);
+            append_custom_mesh_vertices(vertices, mesh_index, mesh, &asset);
+        }
     }
+}
+
+fn mesh_material_vertex_params(mesh: &MeshDraw3D) -> [f32; 4] {
+    [
+        mesh.material.roughness.clamp(0.0, 1.0),
+        mesh.material.metallic.clamp(0.0, 1.0),
+        // z = emissive intensity (0 = no emission)
+        mesh.material.emissive_intensity.max(0.0),
+        // w = normal map flag (>= 0.5 means a normal map is bound at set=3)
+        if mesh.material.normal_texture.is_some() { 1.0 } else { 0.0 },
+    ]
 }
 
 fn append_plane_mesh_vertices(
     vertices: &mut Vec<CubeVertex>,
     mesh_index: usize,
     mesh: &MeshDraw3D,
-    camera_position: [f32; 3],
 ) {
     let half = [mesh.size[0] * 0.5, mesh.size[1] * 0.5, mesh.size[2] * 0.5];
     let local_normal = [0.0, 1.0, 0.0];
-    let world_normal = normalize3(rotate_vector_3d(local_normal, mesh.rotation_radians));
-    let to_camera = normalize3(sub3(camera_position, mesh.center));
-    if dot3(world_normal, to_camera) <= 0.0 {
-        return;
-    }
 
     let p0 = [-half[0], 0.0, -half[2]];
     let p1 = [half[0], 0.0, -half[2]];
@@ -653,6 +816,8 @@ fn append_plane_mesh_vertices(
             uv: uv0,
             albedo: mesh.color,
             object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
         },
         CubeVertex {
             position: p1,
@@ -660,6 +825,8 @@ fn append_plane_mesh_vertices(
             uv: uv1,
             albedo: mesh.color,
             object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
         },
         CubeVertex {
             position: p2,
@@ -667,6 +834,8 @@ fn append_plane_mesh_vertices(
             uv: uv2,
             albedo: mesh.color,
             object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
         },
         CubeVertex {
             position: p0,
@@ -674,6 +843,8 @@ fn append_plane_mesh_vertices(
             uv: uv0,
             albedo: mesh.color,
             object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
         },
         CubeVertex {
             position: p2,
@@ -681,6 +852,8 @@ fn append_plane_mesh_vertices(
             uv: uv2,
             albedo: mesh.color,
             object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
         },
         CubeVertex {
             position: p3,
@@ -688,6 +861,62 @@ fn append_plane_mesh_vertices(
             uv: uv3,
             albedo: mesh.color,
             object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        },
+        CubeVertex {
+            position: p0,
+            normal: [0.0, -1.0, 0.0],
+            uv: uv0,
+            albedo: mesh.color,
+            object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        },
+        CubeVertex {
+            position: p3,
+            normal: [0.0, -1.0, 0.0],
+            uv: uv3,
+            albedo: mesh.color,
+            object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        },
+        CubeVertex {
+            position: p2,
+            normal: [0.0, -1.0, 0.0],
+            uv: uv2,
+            albedo: mesh.color,
+            object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        },
+        CubeVertex {
+            position: p0,
+            normal: [0.0, -1.0, 0.0],
+            uv: uv0,
+            albedo: mesh.color,
+            object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        },
+        CubeVertex {
+            position: p2,
+            normal: [0.0, -1.0, 0.0],
+            uv: uv2,
+            albedo: mesh.color,
+            object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        },
+        CubeVertex {
+            position: p1,
+            normal: [0.0, -1.0, 0.0],
+            uv: uv1,
+            albedo: mesh.color,
+            object_index: mesh_index as u32,
+            material: mesh_material_vertex_params(mesh),
+            tangent: [1.0, 0.0, 0.0, 1.0],
         },
     ]);
 }
@@ -755,6 +984,7 @@ fn append_cube_mesh_vertices(
                 uv: uv0,
                 albedo: mesh.color,
                 object_index: mesh_index as u32,
+                material: mesh_material_vertex_params(mesh),
             },
             CubeVertex {
                 position: p1,
@@ -762,6 +992,7 @@ fn append_cube_mesh_vertices(
                 uv: uv1,
                 albedo: mesh.color,
                 object_index: mesh_index as u32,
+                material: mesh_material_vertex_params(mesh),
             },
             CubeVertex {
                 position: p2,
@@ -769,6 +1000,7 @@ fn append_cube_mesh_vertices(
                 uv: uv2,
                 albedo: mesh.color,
                 object_index: mesh_index as u32,
+                material: mesh_material_vertex_params(mesh),
             },
             CubeVertex {
                 position: p0,
@@ -776,6 +1008,7 @@ fn append_cube_mesh_vertices(
                 uv: uv0,
                 albedo: mesh.color,
                 object_index: mesh_index as u32,
+                material: mesh_material_vertex_params(mesh),
             },
             CubeVertex {
                 position: p2,
@@ -783,6 +1016,7 @@ fn append_cube_mesh_vertices(
                 uv: uv2,
                 albedo: mesh.color,
                 object_index: mesh_index as u32,
+                material: mesh_material_vertex_params(mesh),
             },
             CubeVertex {
                 position: p3,
@@ -790,6 +1024,7 @@ fn append_cube_mesh_vertices(
                 uv: uv3,
                 albedo: mesh.color,
                 object_index: mesh_index as u32,
+                material: mesh_material_vertex_params(mesh),
             },
         ]);
     }
@@ -825,6 +1060,7 @@ fn append_sphere_mesh_vertices(
                     uv: [u0, v0],
                     albedo: mesh.color,
                     object_index: mesh_index as u32,
+                    material: mesh_material_vertex_params(mesh),
                 },
                 CubeVertex {
                     position: p10,
@@ -832,6 +1068,7 @@ fn append_sphere_mesh_vertices(
                     uv: [u1, v0],
                     albedo: mesh.color,
                     object_index: mesh_index as u32,
+                    material: mesh_material_vertex_params(mesh),
                 },
                 CubeVertex {
                     position: p11,
@@ -839,6 +1076,7 @@ fn append_sphere_mesh_vertices(
                     uv: [u1, v1],
                     albedo: mesh.color,
                     object_index: mesh_index as u32,
+                    material: mesh_material_vertex_params(mesh),
                 },
                 CubeVertex {
                     position: p00,
@@ -846,6 +1084,7 @@ fn append_sphere_mesh_vertices(
                     uv: [u0, v0],
                     albedo: mesh.color,
                     object_index: mesh_index as u32,
+                    material: mesh_material_vertex_params(mesh),
                 },
                 CubeVertex {
                     position: p11,
@@ -853,6 +1092,7 @@ fn append_sphere_mesh_vertices(
                     uv: [u1, v1],
                     albedo: mesh.color,
                     object_index: mesh_index as u32,
+                    material: mesh_material_vertex_params(mesh),
                 },
                 CubeVertex {
                     position: p01,
@@ -860,6 +1100,7 @@ fn append_sphere_mesh_vertices(
                     uv: [u0, v1],
                     albedo: mesh.color,
                     object_index: mesh_index as u32,
+                    material: mesh_material_vertex_params(mesh),
                 },
             ]);
         }
@@ -878,6 +1119,8 @@ fn append_custom_mesh_vertices(
         uv: vertex.uv,
         albedo: mesh.color,
         object_index: mesh_index as u32,
+        material: mesh_material_vertex_params(mesh),
+        tangent: vertex.tangent,
     }));
 }
 
@@ -894,6 +1137,7 @@ where
             Some(renderer) => renderer.recreate_swapchain(window),
             None => {
                 self.renderer = Some(VulkanRuntime::new(window, &self.config.api)?);
+                apply_scene_window_preferences(window, &self.config);
                 Ok(())
             }
         }
@@ -905,16 +1149,21 @@ where
         event_loop: &ActiveEventLoop,
         event: &WindowEvent,
     ) -> Result<(), ApiError> {
-        self.scene.window_event(event);
+        self.scene.window_event(window, event);
 
         match event {
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
+                    apply_scene_window_preferences(window, &self.config);
                     self.renderer_mut()?.recreate_swapchain(window)?;
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
+                apply_scene_window_preferences(window, &self.config);
                 self.renderer_mut()?.recreate_swapchain(window)?;
+            }
+            WindowEvent::Focused(_) => {
+                apply_scene_window_preferences(window, &self.config);
             }
             WindowEvent::RedrawRequested => {
                 let size = window.inner_size();
@@ -929,6 +1178,7 @@ where
 
                 self.scene.update(delta_time_seconds);
                 self.config = self.scene.config();
+                apply_scene_window_preferences(window, &self.config);
                 self.frame.clear();
                 self.scene.populate(&mut self.frame);
 
@@ -964,6 +1214,17 @@ where
         if let Some(renderer) = self.renderer.as_ref() {
             renderer.wait_idle();
         }
+    }
+}
+
+fn apply_scene_window_preferences(window: &Window, config: &SceneConfig) {
+    if config.capture_cursor {
+        let _ = window.set_cursor_grab(CursorGrabMode::Locked);
+        let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+        window.set_cursor_visible(false);
+    } else {
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        window.set_cursor_visible(true);
     }
 }
 
@@ -1036,8 +1297,20 @@ impl VulkanRuntime {
             depth_format,
             msaa_samples,
         )?;
-        let render_pass =
-            create_render_pass(&device, swapchain_bundle.format, depth_format, msaa_samples)?;
+        let render_pass = create_render_pass(
+            &device,
+            swapchain_bundle.format,
+            depth_format,
+            msaa_samples,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        )?;
+        let screenshot_render_pass = create_render_pass(
+            &device,
+            swapchain_bundle.format,
+            depth_format,
+            msaa_samples,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        )?;
         let descriptor_set_layout_text_2d = create_sampled_texture_descriptor_set_layout(
             &device,
             &[(
@@ -1046,6 +1319,13 @@ impl VulkanRuntime {
             )],
         )?;
         let descriptor_set_layout_3d = create_cube_descriptor_set_layout(&device)?;
+        let shadow_descriptor_set_layout_3d = create_sampled_texture_descriptor_set_layout(
+            &device,
+            &[(
+                RUNTIME_TEXTURE_SLOT_SHADOW_MAP,
+                vk::ShaderStageFlags::FRAGMENT,
+            )],
+        )?;
         let material_descriptor_set_layout_3d = create_sampled_texture_descriptor_set_layout(
             &device,
             &[(RUNTIME_TEXTURE_SLOT_ALBEDO, vk::ShaderStageFlags::FRAGMENT)],
@@ -1064,6 +1344,28 @@ impl VulkanRuntime {
             descriptor_set_layout_3d,
         )?;
         let (command_pool, command_buffer) = create_command_resources(&device, queue_family_index)?;
+        let shadow_descriptor_resources = create_sampled_texture_descriptor_resources(
+            &device,
+            shadow_descriptor_set_layout_3d,
+            1,
+        )?;
+        let shadow_descriptor_pool_3d = shadow_descriptor_resources.pool;
+        let shadow_descriptor_set_3d = shadow_descriptor_resources.set;
+        let (shadow_map_image, shadow_map_memory, shadow_map_view, shadow_map_sampler) =
+            create_shadow_map_resources(
+                &instance,
+                &device,
+                physical_device,
+                depth_format,
+                SHADOW_MAP_SIZE,
+            )?;
+        let shadow_render_pass = create_shadow_render_pass(&device, depth_format)?;
+        let shadow_framebuffer = create_shadow_framebuffer(
+            &device,
+            shadow_render_pass,
+            shadow_map_view,
+            SHADOW_MAP_SIZE,
+        )?;
         let (font_atlas_layout, font_rgba, font_width, font_height) = build_font_atlas()?;
         let (white_texture_image, white_texture_memory, white_texture_view, white_texture_sampler) =
             create_solid_color_texture(
@@ -1118,11 +1420,31 @@ impl VulkanRuntime {
                 },
             )],
         );
+        register_sampled_texture_descriptor(
+            &mut executor_resources,
+            RUNTIME_DESCRIPTOR_SET_SHADOW_3D,
+            shadow_descriptor_set_3d,
+            &[(RUNTIME_TEXTURE_SLOT_SHADOW_MAP, 0)],
+            &[(
+                RUNTIME_TEXTURE_SHADOW_MAP,
+                TextureBinding {
+                    image_view: shadow_map_view,
+                    sampler: shadow_map_sampler,
+                    image_layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                },
+            )],
+        );
         update_sampled_texture_descriptor(
             &device,
             &executor_resources,
             RUNTIME_DESCRIPTOR_SET_TEXT_2D,
             &[(RUNTIME_TEXTURE_SLOT_TEXT_ATLAS, RUNTIME_TEXTURE_FONT_ATLAS)],
+        );
+        update_sampled_texture_descriptor(
+            &device,
+            &executor_resources,
+            RUNTIME_DESCRIPTOR_SET_SHADOW_3D,
+            &[(RUNTIME_TEXTURE_SLOT_SHADOW_MAP, RUNTIME_TEXTURE_SHADOW_MAP)],
         );
         register_sampled_texture_descriptor(
             &mut executor_resources,
@@ -1171,10 +1493,13 @@ impl VulkanRuntime {
             msaa_samples,
             descriptor_set_layout_3d,
             material_descriptor_set_layout_3d,
+            shadow_descriptor_set_layout_3d,
             &mut pipeline_compiler,
             &mut graphics_pipeline_cache,
             &mut executor_resources,
         )?;
+        let (shadow_pipeline_layout, shadow_graphics_pipeline) =
+            create_shadow_pipeline_3d(&device, shadow_render_pass, descriptor_set_layout_3d)?;
         let framebuffers = create_framebuffers(
             &device,
             render_pass,
@@ -1223,8 +1548,10 @@ impl VulkanRuntime {
             present_queue,
             swapchain_loader,
             swapchain: swapchain_bundle.swapchain,
+            swapchain_images: swapchain_bundle.images,
             swapchain_image_views: swapchain_bundle.image_views,
             swapchain_extent: swapchain_bundle.extent,
+            swapchain_format: swapchain_bundle.format,
             msaa_samples,
             color_image,
             color_image_memory,
@@ -1234,6 +1561,7 @@ impl VulkanRuntime {
             depth_image_memory,
             depth_image_view,
             render_pass,
+            screenshot_render_pass,
             pipeline_layout_2d,
             graphics_pipeline_2d,
             descriptor_set_layout_text_2d,
@@ -1244,11 +1572,22 @@ impl VulkanRuntime {
             descriptor_set_layout_3d,
             descriptor_pool_3d,
             descriptor_set_3d,
+            shadow_descriptor_set_layout_3d,
+            shadow_descriptor_pool_3d,
+            shadow_descriptor_set_3d,
             material_descriptor_set_layout_3d,
             material_descriptor_pool_3d,
             default_material_descriptor_set_3d,
             pipeline_layout_3d,
             graphics_pipeline_3d,
+            shadow_render_pass,
+            shadow_pipeline_layout,
+            shadow_graphics_pipeline,
+            shadow_map_image,
+            shadow_map_memory,
+            shadow_map_view,
+            shadow_map_sampler,
+            shadow_framebuffer,
             executor_resources,
             graphics_pipeline_cache,
             pipeline_compiler,
@@ -1330,17 +1669,25 @@ impl VulkanRuntime {
             &self.font_atlas_layout,
             self.swapchain_extent,
         );
+        let screenshot_requested = scene_config.screenshot_path.is_some();
+        let screenshot_sample_count = if screenshot_requested {
+            scene_config.screenshot_accumulation_samples.max(1)
+        } else {
+            1
+        };
         let (
             cube_vertices,
             cube_draw_batches,
-            cube_view_projection,
-            cube_scene_uniforms,
+            shadow_draw_batches,
+            _cube_view_projection,
+            _cube_scene_uniforms,
             gpu_cubes,
         ) = build_mesh_vertices(
             frame,
             scene_config.camera_3d,
             scene_config.lighting,
             self.swapchain_extent,
+            [0.0, 0.0],
         );
         self.ensure_primitive_capacity(primitive_instances.len())?;
         self.upload_primitive_instances(&primitive_instances)?;
@@ -1348,43 +1695,209 @@ impl VulkanRuntime {
         self.upload_text_glyph_instances(&text_glyph_instances)?;
         self.ensure_cube_vertex_capacity(cube_vertices.len())?;
         self.upload_cube_vertices(&cube_vertices)?;
-        self.upload_cube_scene_uniforms(&cube_scene_uniforms)?;
         self.upload_cube_objects(&gpu_cubes)?;
+        let screenshot_readback = if scene_config.screenshot_path.is_some() {
+            Some(create_buffer(
+                &self.instance,
+                &self.device,
+                self.physical_device,
+                (self.swapchain_extent.width as vk::DeviceSize)
+                    * (self.swapchain_extent.height as vk::DeviceSize)
+                    * 4,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?)
+        } else {
+            None
+        };
 
-        vk_result(
-            unsafe {
-                self.device
-                    .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
-            },
-            "reset_command_buffer",
-        )?;
-        self.record_command_buffer(
-            image_index,
-            scene_config,
-            primitive_instances.len() as u32,
-            text_glyph_instances.len() as u32,
-            &cube_draw_batches,
-            cube_view_projection,
-        )?;
+        if screenshot_requested {
+            let screenshot_byte_len = (self.swapchain_extent.width as usize)
+                * (self.swapchain_extent.height as usize)
+                * 4;
+            let mut screenshot_accumulator = if screenshot_sample_count > 1 {
+                Some(vec![0.0_f32; screenshot_byte_len])
+            } else {
+                None
+            };
 
-        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let wait_semaphores = [self.image_available_semaphore];
+            for sample_index in 0..screenshot_sample_count {
+                let camera_jitter_ndc = if screenshot_sample_count > 1 {
+                    screenshot_camera_jitter(sample_index, self.swapchain_extent)
+                } else {
+                    [0.0, 0.0]
+                };
+                let (_, _, _, cube_view_projection, cube_scene_uniforms, _) = build_mesh_vertices(
+                    frame,
+                    scene_config.camera_3d,
+                    scene_config.lighting,
+                    self.swapchain_extent,
+                    camera_jitter_ndc,
+                );
+                self.upload_cube_scene_uniforms(&cube_scene_uniforms)?;
+                let shadow_view_projection = CubeViewProjectionPushConstants {
+                    view_projection: cube_scene_uniforms.shadow_view_projection,
+                };
+
+                vk_result(
+                    unsafe {
+                        self.device.reset_command_buffer(
+                            self.command_buffer,
+                            vk::CommandBufferResetFlags::empty(),
+                        )
+                    },
+                    "reset_command_buffer",
+                )?;
+                self.record_command_buffer(
+                    image_index,
+                    scene_config,
+                    primitive_instances.len() as u32,
+                    text_glyph_instances.len() as u32,
+                    &cube_draw_batches,
+                    &shadow_draw_batches,
+                    cube_view_projection,
+                    shadow_view_projection,
+                    screenshot_readback.as_ref().map(|(buffer, _)| *buffer),
+                )?;
+
+                let command_buffers = [self.command_buffer];
+                let mut submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let wait_semaphores = [self.image_available_semaphore];
+                let signal_semaphores = [self.render_finished_semaphore];
+                if sample_index == 0 {
+                    submit_info = submit_info
+                        .wait_semaphores(&wait_semaphores)
+                        .wait_dst_stage_mask(&wait_stages);
+                }
+                if sample_index == screenshot_sample_count - 1 {
+                    submit_info = submit_info.signal_semaphores(&signal_semaphores);
+                }
+
+                vk_result(
+                    unsafe {
+                        self.device.queue_submit(
+                            self.graphics_queue,
+                            &[submit_info],
+                            self.in_flight_fence,
+                        )
+                    },
+                    "queue_submit",
+                )?;
+                vk_result(
+                    unsafe {
+                        self.device
+                            .wait_for_fences(&[self.in_flight_fence], true, u64::MAX)
+                    },
+                    "wait_for_fences(screenshot_sample)",
+                )?;
+
+                if let (Some((_, memory)), Some(accumulator)) = (
+                    screenshot_readback.as_ref(),
+                    screenshot_accumulator.as_mut(),
+                ) {
+                    let rgba = read_screenshot_rgba_from_memory(
+                        &self.device,
+                        *memory,
+                        self.swapchain_extent,
+                        self.swapchain_format,
+                    )?;
+                    accumulate_screenshot_rgba(accumulator, &rgba);
+                }
+
+                if sample_index + 1 < screenshot_sample_count {
+                    vk_result(
+                        unsafe { self.device.reset_fences(&[self.in_flight_fence]) },
+                        "reset_fences(screenshot_sample)",
+                    )?;
+                }
+            }
+
+            if let (Some(path), Some((buffer, memory))) =
+                (scene_config.screenshot_path.as_ref(), screenshot_readback)
+            {
+                let save_result = if let Some(accumulator) = screenshot_accumulator.as_ref() {
+                    let rgba =
+                        resolve_accumulated_screenshot_rgba(accumulator, screenshot_sample_count);
+                    save_screenshot_rgba(
+                        &rgba,
+                        self.swapchain_extent,
+                        screenshot_output_extent(scene_config.screenshot_resolution),
+                        path,
+                    )
+                } else {
+                    save_screenshot_from_buffer(
+                        &self.device,
+                        memory,
+                        self.swapchain_extent,
+                        self.swapchain_format,
+                        screenshot_output_extent(scene_config.screenshot_resolution),
+                        path,
+                    )
+                };
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+                save_result?;
+            }
+        } else {
+            let (_, _, _, cube_view_projection, cube_scene_uniforms, _) = build_mesh_vertices(
+                frame,
+                scene_config.camera_3d,
+                scene_config.lighting,
+                self.swapchain_extent,
+                [0.0, 0.0],
+            );
+            self.upload_cube_scene_uniforms(&cube_scene_uniforms)?;
+            let shadow_view_projection = CubeViewProjectionPushConstants {
+                view_projection: cube_scene_uniforms.shadow_view_projection,
+            };
+
+            vk_result(
+                unsafe {
+                    self.device.reset_command_buffer(
+                        self.command_buffer,
+                        vk::CommandBufferResetFlags::empty(),
+                    )
+                },
+                "reset_command_buffer",
+            )?;
+            self.record_command_buffer(
+                image_index,
+                scene_config,
+                primitive_instances.len() as u32,
+                text_glyph_instances.len() as u32,
+                &cube_draw_batches,
+                &shadow_draw_batches,
+                cube_view_projection,
+                shadow_view_projection,
+                None,
+            )?;
+
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let wait_semaphores = [self.image_available_semaphore];
+            let signal_semaphores = [self.render_finished_semaphore];
+            let command_buffers = [self.command_buffer];
+            let submit_infos = [vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores)];
+
+            vk_result(
+                unsafe {
+                    self.device.queue_submit(
+                        self.graphics_queue,
+                        &submit_infos,
+                        self.in_flight_fence,
+                    )
+                },
+                "queue_submit",
+            )?;
+        }
+
         let signal_semaphores = [self.render_finished_semaphore];
-        let command_buffers = [self.command_buffer];
-        let submit_infos = [vk::SubmitInfo::default()
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(&command_buffers)
-            .signal_semaphores(&signal_semaphores)];
-
-        vk_result(
-            unsafe {
-                self.device
-                    .queue_submit(self.graphics_queue, &submit_infos, self.in_flight_fence)
-            },
-            "queue_submit",
-        )?;
-
         let swapchains = [self.swapchain];
         let image_indices = [image_index];
         let present_info = vk::PresentInfoKHR::default()
@@ -1412,7 +1925,10 @@ impl VulkanRuntime {
         primitive_count: u32,
         text_glyph_count: u32,
         cube_draw_batches: &[MeshDrawBatch3D],
+        shadow_draw_batches: &[MeshDrawBatch3D],
         cube_view_projection: CubeViewProjectionPushConstants,
+        shadow_view_projection: CubeViewProjectionPushConstants,
+        screenshot_readback_buffer: Option<vk::Buffer>,
     ) -> Result<(), ApiError> {
         let begin_info = vk::CommandBufferBeginInfo::default();
         vk_result(
@@ -1422,6 +1938,90 @@ impl VulkanRuntime {
             },
             "begin_command_buffer",
         )?;
+
+        if matches!(scene_config.lighting.shadows.mode, ShadowMode::Live)
+            && !shadow_draw_batches.is_empty()
+        {
+            let shadow_clear_values = [vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            }];
+            let shadow_render_pass_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.shadow_render_pass)
+                .framebuffer(self.shadow_framebuffer)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: SHADOW_MAP_SIZE,
+                        height: SHADOW_MAP_SIZE,
+                    },
+                })
+                .clear_values(&shadow_clear_values);
+            unsafe {
+                self.device.cmd_begin_render_pass(
+                    self.command_buffer,
+                    &shadow_render_pass_begin,
+                    vk::SubpassContents::INLINE,
+                );
+                let shadow_viewports = [vk::Viewport::default()
+                    .x(0.0)
+                    .y(0.0)
+                    .width(SHADOW_MAP_SIZE as f32)
+                    .height(SHADOW_MAP_SIZE as f32)
+                    .min_depth(0.0)
+                    .max_depth(1.0)];
+                let shadow_scissors = [vk::Rect2D::default()
+                    .offset(vk::Offset2D { x: 0, y: 0 })
+                    .extent(vk::Extent2D {
+                        width: SHADOW_MAP_SIZE,
+                        height: SHADOW_MAP_SIZE,
+                    })];
+                let cube_vertex_buffers = [self.cube_vertex_buffer];
+                let offsets = [0_u64];
+                self.device
+                    .cmd_set_viewport(self.command_buffer, 0, &shadow_viewports);
+                self.device
+                    .cmd_set_scissor(self.command_buffer, 0, &shadow_scissors);
+                self.device.cmd_bind_pipeline(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.shadow_graphics_pipeline,
+                );
+                self.device.cmd_bind_descriptor_sets(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.shadow_pipeline_layout,
+                    0,
+                    &[self.descriptor_set_3d],
+                    &[],
+                );
+                self.device.cmd_bind_vertex_buffers(
+                    self.command_buffer,
+                    0,
+                    &cube_vertex_buffers,
+                    &offsets,
+                );
+                self.device.cmd_push_constants(
+                    self.command_buffer,
+                    self.shadow_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    cube_view_projection_as_bytes(&shadow_view_projection),
+                );
+                for batch in shadow_draw_batches {
+                    self.device.cmd_draw(
+                        self.command_buffer,
+                        batch.vertex_count,
+                        1,
+                        batch.first_vertex,
+                        0,
+                    );
+                }
+                self.device.cmd_end_render_pass(self.command_buffer);
+            }
+        }
 
         let clear_values = if self.msaa_samples == vk::SampleCountFlags::TYPE_1 {
             vec![
@@ -1500,6 +2100,14 @@ impl VulkanRuntime {
                     self.pipeline_layout_3d,
                     0,
                     &[self.descriptor_set_3d],
+                    &[],
+                );
+                self.device.cmd_bind_descriptor_sets(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout_3d,
+                    2,
+                    &[self.shadow_descriptor_set_3d],
                     &[],
                 );
                 self.device.cmd_bind_vertex_buffers(
@@ -1581,6 +2189,15 @@ impl VulkanRuntime {
             }
 
             self.device.cmd_end_render_pass(self.command_buffer);
+            if let Some(readback_buffer) = screenshot_readback_buffer {
+                record_screenshot_copy_commands(
+                    &self.device,
+                    self.command_buffer,
+                    self.swapchain_images[image_index as usize],
+                    readback_buffer,
+                    self.swapchain_extent,
+                );
+            }
         }
 
         vk_result(
@@ -1942,6 +2559,14 @@ impl VulkanRuntime {
             swapchain_bundle.format,
             self.depth_format,
             self.msaa_samples,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        )?;
+        let screenshot_render_pass = create_render_pass(
+            &self.device,
+            swapchain_bundle.format,
+            self.depth_format,
+            self.msaa_samples,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         )?;
         let (pipeline_layout_2d, graphics_pipeline_2d) = create_graphics_pipeline_2d(
             &self.device,
@@ -1967,6 +2592,7 @@ impl VulkanRuntime {
             self.msaa_samples,
             self.descriptor_set_layout_3d,
             self.material_descriptor_set_layout_3d,
+            self.shadow_descriptor_set_layout_3d,
             &mut self.pipeline_compiler,
             &mut self.graphics_pipeline_cache,
             &mut self.executor_resources,
@@ -1982,8 +2608,10 @@ impl VulkanRuntime {
         )?;
 
         self.swapchain = swapchain_bundle.swapchain;
+        self.swapchain_images = swapchain_bundle.images;
         self.swapchain_image_views = swapchain_bundle.image_views;
         self.swapchain_extent = swapchain_bundle.extent;
+        self.swapchain_format = swapchain_bundle.format;
         self.color_image = color_image;
         self.color_image_memory = color_image_memory;
         self.color_image_view = color_image_view;
@@ -1991,6 +2619,7 @@ impl VulkanRuntime {
         self.depth_image_memory = depth_image_memory;
         self.depth_image_view = depth_image_view;
         self.render_pass = render_pass;
+        self.screenshot_render_pass = screenshot_render_pass;
         self.pipeline_layout_2d = pipeline_layout_2d;
         self.graphics_pipeline_2d = graphics_pipeline_2d;
         self.pipeline_layout_text_2d = pipeline_layout_text_2d;
@@ -2031,6 +2660,11 @@ impl VulkanRuntime {
             if self.render_pass != vk::RenderPass::null() {
                 self.device.destroy_render_pass(self.render_pass, None);
                 self.render_pass = vk::RenderPass::null();
+            }
+            if self.screenshot_render_pass != vk::RenderPass::null() {
+                self.device
+                    .destroy_render_pass(self.screenshot_render_pass, None);
+                self.screenshot_render_pass = vk::RenderPass::null();
             }
             if self.color_image_view != vk::ImageView::null() {
                 self.device.destroy_image_view(self.color_image_view, None);
@@ -2137,10 +2771,42 @@ impl Drop for VulkanRuntime {
             if self.font_atlas_memory != vk::DeviceMemory::null() {
                 self.device.free_memory(self.font_atlas_memory, None);
             }
+            if self.shadow_map_sampler != vk::Sampler::null() {
+                self.device.destroy_sampler(self.shadow_map_sampler, None);
+            }
+            if self.shadow_framebuffer != vk::Framebuffer::null() {
+                self.device
+                    .destroy_framebuffer(self.shadow_framebuffer, None);
+            }
+            if self.shadow_map_view != vk::ImageView::null() {
+                self.device.destroy_image_view(self.shadow_map_view, None);
+            }
+            if self.shadow_map_image != vk::Image::null() {
+                self.device.destroy_image(self.shadow_map_image, None);
+            }
+            if self.shadow_map_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.shadow_map_memory, None);
+            }
+            if self.shadow_graphics_pipeline != vk::Pipeline::null() {
+                self.device
+                    .destroy_pipeline(self.shadow_graphics_pipeline, None);
+            }
+            if self.shadow_pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.shadow_pipeline_layout, None);
+            }
+            if self.shadow_render_pass != vk::RenderPass::null() {
+                self.device
+                    .destroy_render_pass(self.shadow_render_pass, None);
+            }
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool_text_2d, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout_text_2d, None);
+            self.device
+                .destroy_descriptor_pool(self.shadow_descriptor_pool_3d, None);
+            self.device
+                .destroy_descriptor_set_layout(self.shadow_descriptor_set_layout_3d, None);
             self.device
                 .destroy_descriptor_pool(self.material_descriptor_pool_3d, None);
             self.device
@@ -2353,7 +3019,7 @@ fn create_swapchain_bundle(
         .image_format(chosen_format.format)
         .image_extent(extent)
         .image_array_layers(1)
-        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
         .queue_family_indices(&queue_family_indices)
         .pre_transform(capabilities.current_transform)
@@ -2370,7 +3036,7 @@ fn create_swapchain_bundle(
     )?;
 
     let mut image_views = Vec::with_capacity(swapchain_images.len());
-    for image in swapchain_images {
+    for image in &swapchain_images {
         let subresource_range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .base_mip_level(0)
@@ -2379,7 +3045,7 @@ fn create_swapchain_bundle(
             .layer_count(1);
 
         let image_view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
+            .image(*image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(chosen_format.format)
             .subresource_range(subresource_range);
@@ -2393,6 +3059,7 @@ fn create_swapchain_bundle(
 
     Ok(SwapchainBundle {
         swapchain,
+        images: swapchain_images,
         image_views,
         extent,
         format: chosen_format.format,
@@ -2404,6 +3071,7 @@ fn create_render_pass(
     color_format: vk::Format,
     depth_format: vk::Format,
     msaa_samples: vk::SampleCountFlags,
+    final_color_layout: vk::ImageLayout,
 ) -> Result<vk::RenderPass, ApiError> {
     if msaa_samples == vk::SampleCountFlags::TYPE_1 {
         let color_attachment = vk::AttachmentDescription::default()
@@ -2414,7 +3082,7 @@ fn create_render_pass(
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+            .final_layout(final_color_layout);
         let depth_attachment = vk::AttachmentDescription::default()
             .format(depth_format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -2474,7 +3142,7 @@ fn create_render_pass(
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        .final_layout(final_color_layout);
     let depth_attachment = vk::AttachmentDescription::default()
         .format(depth_format)
         .samples(msaa_samples)
@@ -2756,6 +3424,7 @@ fn create_graphics_pipeline_3d(
     msaa_samples: vk::SampleCountFlags,
     descriptor_set_layout: vk::DescriptorSetLayout,
     material_descriptor_set_layout: vk::DescriptorSetLayout,
+    shadow_descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_compiler: &mut VulkanGraphicsPipelineCompiler,
     graphics_pipeline_cache: &mut GraphicsPipelineCache,
     executor_resources: &mut ExecutorResources,
@@ -2764,7 +3433,11 @@ fn create_graphics_pipeline_3d(
         .stage_flags(vk::ShaderStageFlags::VERTEX)
         .offset(0)
         .size(size_of::<CubeViewProjectionPushConstants>() as u32)];
-    let set_layouts = [descriptor_set_layout, material_descriptor_set_layout];
+    let set_layouts = [
+        descriptor_set_layout,
+        material_descriptor_set_layout,
+        shadow_descriptor_set_layout,
+    ];
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(&set_layouts)
         .push_constant_ranges(&push_constant_ranges);
@@ -2873,6 +3546,29 @@ fn compile_runtime_graphics_pipeline_3d(
                 normalized: false,
                 stride: size_of::<CubeVertex>() as i32,
                 offset_bytes: 48,
+                enabled: true,
+                divisor: 0,
+            },
+            VertexAttributeBinding {
+                index: 5,
+                binding: 0,
+                size: 4,
+                attrib_type: crate::syntax::VertexAttribType::Float32,
+                normalized: false,
+                stride: size_of::<CubeVertex>() as i32,
+                offset_bytes: 52,
+                enabled: true,
+                divisor: 0,
+            },
+            // location 6: tangent (vec4, offset 68 = 52 + 16)
+            VertexAttributeBinding {
+                index: 6,
+                binding: 0,
+                size: 4,
+                attrib_type: crate::syntax::VertexAttribType::Float32,
+                normalized: false,
+                stride: size_of::<CubeVertex>() as i32,
+                offset_bytes: 68,
                 enabled: true,
                 divisor: 0,
             },
@@ -3141,6 +3837,482 @@ fn create_color_resources(
     };
 
     Ok((image, memory, image_view))
+}
+
+#[allow(dead_code)]
+fn create_screenshot_color_target(
+    instance: &Instance,
+    device: &Device,
+    physical_device: vk::PhysicalDevice,
+    extent: vk::Extent2D,
+    format: vk::Format,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), ApiError> {
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: extent.width.max(1),
+            height: extent.height.max(1),
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = vk_result(
+        unsafe { device.create_image(&image_info, None) },
+        "create_image(screenshot_color)",
+    )?;
+    let memory_requirements = unsafe { device.get_image_memory_requirements(image) };
+    let memory_type_index = find_memory_type(
+        instance,
+        physical_device,
+        memory_requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    let allocation_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(memory_requirements.size)
+        .memory_type_index(memory_type_index);
+    let memory = match vk_result(
+        unsafe { device.allocate_memory(&allocation_info, None) },
+        "allocate_memory(screenshot_color)",
+    ) {
+        Ok(memory) => memory,
+        Err(err) => {
+            unsafe { device.destroy_image(image, None) };
+            return Err(err);
+        }
+    };
+    if let Err(err) = vk_result(
+        unsafe { device.bind_image_memory(image, memory, 0) },
+        "bind_image_memory(screenshot_color)",
+    ) {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_image(image, None);
+        }
+        return Err(err);
+    }
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        );
+    let view = match vk_result(
+        unsafe { device.create_image_view(&view_info, None) },
+        "create_image_view(screenshot_color)",
+    ) {
+        Ok(view) => view,
+        Err(err) => {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(err);
+        }
+    };
+    Ok((image, memory, view))
+}
+
+#[allow(dead_code)]
+fn create_screenshot_render_target(
+    instance: &Instance,
+    device: &Device,
+    physical_device: vk::PhysicalDevice,
+    render_pass: vk::RenderPass,
+    color_format: vk::Format,
+    depth_format: vk::Format,
+    extent: vk::Extent2D,
+    msaa_samples: vk::SampleCountFlags,
+) -> Result<ScreenshotRenderTarget, ApiError> {
+    let (color_image, color_image_memory, color_image_view) =
+        if msaa_samples == vk::SampleCountFlags::TYPE_1 {
+            (
+                vk::Image::null(),
+                vk::DeviceMemory::null(),
+                vk::ImageView::null(),
+            )
+        } else {
+            create_color_resources(
+                instance,
+                device,
+                physical_device,
+                extent,
+                color_format,
+                msaa_samples,
+            )?
+        };
+    let (resolve_image, resolve_image_memory, resolve_image_view) =
+        create_screenshot_color_target(instance, device, physical_device, extent, color_format)?;
+    let (depth_image, depth_image_memory, depth_image_view) = create_depth_resources(
+        instance,
+        device,
+        physical_device,
+        extent,
+        depth_format,
+        msaa_samples,
+    )?;
+    let attachments = if msaa_samples == vk::SampleCountFlags::TYPE_1 {
+        vec![resolve_image_view, depth_image_view]
+    } else {
+        vec![color_image_view, resolve_image_view, depth_image_view]
+    };
+    let framebuffer_info = vk::FramebufferCreateInfo::default()
+        .render_pass(render_pass)
+        .attachments(&attachments)
+        .width(extent.width)
+        .height(extent.height)
+        .layers(1);
+    let framebuffer = vk_result(
+        unsafe { device.create_framebuffer(&framebuffer_info, None) },
+        "create_framebuffer(screenshot)",
+    )?;
+    let (readback_buffer, readback_memory) = create_buffer(
+        instance,
+        device,
+        physical_device,
+        (extent.width as vk::DeviceSize) * (extent.height as vk::DeviceSize) * 4,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    Ok(ScreenshotRenderTarget {
+        extent,
+        framebuffer,
+        color_image,
+        color_image_memory,
+        color_image_view,
+        resolve_image,
+        resolve_image_memory,
+        resolve_image_view,
+        depth_image,
+        depth_image_memory,
+        depth_image_view,
+        readback_buffer,
+        readback_memory,
+    })
+}
+
+#[allow(dead_code)]
+fn destroy_screenshot_render_target(device: &Device, target: ScreenshotRenderTarget) {
+    unsafe {
+        device.destroy_buffer(target.readback_buffer, None);
+        device.free_memory(target.readback_memory, None);
+        device.destroy_framebuffer(target.framebuffer, None);
+        device.destroy_image_view(target.resolve_image_view, None);
+        device.destroy_image(target.resolve_image, None);
+        device.free_memory(target.resolve_image_memory, None);
+        device.destroy_image_view(target.depth_image_view, None);
+        device.destroy_image(target.depth_image, None);
+        device.free_memory(target.depth_image_memory, None);
+        if target.color_image_view != vk::ImageView::null() {
+            device.destroy_image_view(target.color_image_view, None);
+        }
+        if target.color_image != vk::Image::null() {
+            device.destroy_image(target.color_image, None);
+        }
+        if target.color_image_memory != vk::DeviceMemory::null() {
+            device.free_memory(target.color_image_memory, None);
+        }
+    }
+}
+
+fn create_shadow_render_pass(
+    device: &Device,
+    depth_format: vk::Format,
+) -> Result<vk::RenderPass, ApiError> {
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(depth_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    let depth_attachment_ref = vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let subpasses = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .depth_stencil_attachment(&depth_attachment_ref)];
+    let dependencies = [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+            .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ),
+    ];
+    let attachments = [depth_attachment];
+    let render_pass_info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses)
+        .dependencies(&dependencies);
+    vk_result(
+        unsafe { device.create_render_pass(&render_pass_info, None) },
+        "create_shadow_render_pass",
+    )
+}
+
+fn create_shadow_map_resources(
+    instance: &Instance,
+    device: &Device,
+    physical_device: vk::PhysicalDevice,
+    format: vk::Format,
+    size: u32,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler), ApiError> {
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: size.max(1),
+            height: size.max(1),
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = vk_result(
+        unsafe { device.create_image(&image_info, None) },
+        "create_image(shadow_map)",
+    )?;
+    let memory_requirements = unsafe { device.get_image_memory_requirements(image) };
+    let memory_type_index = find_memory_type(
+        instance,
+        physical_device,
+        memory_requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    let allocation_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(memory_requirements.size)
+        .memory_type_index(memory_type_index);
+    let memory = match vk_result(
+        unsafe { device.allocate_memory(&allocation_info, None) },
+        "allocate_memory(shadow_map)",
+    ) {
+        Ok(memory) => memory,
+        Err(err) => {
+            unsafe { device.destroy_image(image, None) };
+            return Err(err);
+        }
+    };
+    if let Err(err) = vk_result(
+        unsafe { device.bind_image_memory(image, memory, 0) },
+        "bind_image_memory(shadow_map)",
+    ) {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_image(image, None);
+        }
+        return Err(err);
+    }
+
+    let subresource_range = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1);
+    let image_view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(subresource_range);
+    let image_view = match vk_result(
+        unsafe { device.create_image_view(&image_view_info, None) },
+        "create_image_view(shadow_map)",
+    ) {
+        Ok(view) => view,
+        Err(err) => {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(err);
+        }
+    };
+
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+        .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+        .max_lod(1.0)
+        .compare_enable(false);
+    let sampler = match vk_result(
+        unsafe { device.create_sampler(&sampler_info, None) },
+        "create_sampler(shadow_map)",
+    ) {
+        Ok(sampler) => sampler,
+        Err(err) => {
+            unsafe {
+                device.destroy_image_view(image_view, None);
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(err);
+        }
+    };
+
+    Ok((image, memory, image_view, sampler))
+}
+
+fn create_shadow_framebuffer(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    depth_image_view: vk::ImageView,
+    size: u32,
+) -> Result<vk::Framebuffer, ApiError> {
+    let attachments = [depth_image_view];
+    let framebuffer_info = vk::FramebufferCreateInfo::default()
+        .render_pass(render_pass)
+        .attachments(&attachments)
+        .width(size.max(1))
+        .height(size.max(1))
+        .layers(1);
+    vk_result(
+        unsafe { device.create_framebuffer(&framebuffer_info, None) },
+        "create_framebuffer(shadow_map)",
+    )
+}
+
+fn create_shadow_pipeline_3d(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+) -> Result<(vk::PipelineLayout, vk::Pipeline), ApiError> {
+    let push_constant_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(size_of::<CubeViewProjectionPushConstants>() as u32)];
+    let set_layouts = [descriptor_set_layout];
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(&push_constant_ranges);
+    let pipeline_layout = vk_result(
+        unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) },
+        "create_pipeline_layout(shadow_3d)",
+    )?;
+
+    let vertex_words = read_spirv_words(SHADOW_3D_VERT_SPV)?;
+    let vertex_module_info = vk::ShaderModuleCreateInfo::default().code(&vertex_words);
+    let vertex_module = match vk_result(
+        unsafe { device.create_shader_module(&vertex_module_info, None) },
+        "create_shader_module(shadow_3d.vert)",
+    ) {
+        Ok(module) => module,
+        Err(err) => {
+            unsafe { device.destroy_pipeline_layout(pipeline_layout, None) };
+            return Err(err);
+        }
+    };
+    let entry_name = CString::new("main").expect("shader entry point");
+    let shader_stages = [vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::VERTEX)
+        .module(vertex_module)
+        .name(&entry_name)];
+    let vertex_binding_descriptions = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(size_of::<CubeVertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+    let vertex_attribute_descriptions = [
+        vk::VertexInputAttributeDescription::default()
+            .location(0)
+            .binding(0)
+            .format(vk::Format::R32G32B32_SFLOAT)
+            .offset(0),
+        vk::VertexInputAttributeDescription::default()
+            .location(4)
+            .binding(0)
+            .format(vk::Format::R32_UINT)
+            .offset(48),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&vertex_binding_descriptions)
+        .vertex_attribute_descriptions(&vertex_attribute_descriptions);
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .line_width(1.0)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .depth_bias_enable(true)
+        .depth_bias_constant_factor(0.6)
+        .depth_bias_slope_factor(1.2);
+    let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+        .stencil_test_enable(false);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default();
+    let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+        .stages(&shader_stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterizer)
+        .multisample_state(&multisampling)
+        .depth_stencil_state(&depth_stencil)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0)];
+    let pipeline = match unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+    } {
+        Ok(mut pipelines) => pipelines.remove(0),
+        Err((_, result)) => {
+            unsafe {
+                device.destroy_shader_module(vertex_module, None);
+                device.destroy_pipeline_layout(pipeline_layout, None);
+            }
+            return Err(ApiError::Vulkan {
+                context: "create_graphics_pipelines(shadow_3d)",
+                result,
+            });
+        }
+    };
+    unsafe {
+        device.destroy_shader_module(vertex_module, None);
+    }
+    Ok((pipeline_layout, pipeline))
 }
 
 fn create_solid_color_texture(
@@ -3590,6 +4762,215 @@ fn transition_image_layout(
             &barrier,
         );
     }
+}
+
+fn record_screenshot_copy_commands(
+    device: &Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    buffer: vk::Buffer,
+    extent: vk::Extent2D,
+) {
+    let to_transfer = [vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        )];
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_transfer,
+        );
+    }
+
+    let copy_region = [vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })];
+    unsafe {
+        device.cmd_copy_image_to_buffer(
+            command_buffer,
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer,
+            &copy_region,
+        );
+    }
+
+    let to_present = [vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        )];
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_present,
+        );
+    }
+}
+
+fn save_screenshot_from_buffer(
+    device: &Device,
+    memory: vk::DeviceMemory,
+    source_extent: vk::Extent2D,
+    format: vk::Format,
+    output_extent: vk::Extent2D,
+    path: &Path,
+) -> Result<(), ApiError> {
+    let rgba = read_screenshot_rgba_from_memory(device, memory, source_extent, format)?;
+    save_screenshot_rgba(&rgba, source_extent, output_extent, path)
+}
+
+fn read_screenshot_rgba_from_memory(
+    device: &Device,
+    memory: vk::DeviceMemory,
+    extent: vk::Extent2D,
+    format: vk::Format,
+) -> Result<Vec<u8>, ApiError> {
+    let byte_len = (extent.width as usize) * (extent.height as usize) * 4;
+    let mapped = vk_result(
+        unsafe { device.map_memory(memory, 0, byte_len as u64, vk::MemoryMapFlags::empty()) },
+        "map_memory(screenshot_readback)",
+    )?;
+    let raw = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), byte_len) };
+    let mut rgba = vec![0_u8; byte_len];
+    match format {
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
+            for (src, dst) in raw.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = src[3];
+            }
+        }
+        vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => {
+            rgba.copy_from_slice(raw);
+        }
+        unsupported => {
+            unsafe { device.unmap_memory(memory) };
+            return Err(ApiError::Window {
+                reason: format!("unsupported screenshot swapchain format: {unsupported:?}"),
+            });
+        }
+    }
+    unsafe { device.unmap_memory(memory) };
+
+    Ok(rgba)
+}
+
+fn save_screenshot_rgba(
+    rgba: &[u8],
+    source_extent: vk::Extent2D,
+    output_extent: vk::Extent2D,
+    path: &Path,
+) -> Result<(), ApiError> {
+    let output_rgba = if output_extent == source_extent {
+        rgba.to_vec()
+    } else {
+        let image =
+            image::RgbaImage::from_raw(source_extent.width, source_extent.height, rgba.to_vec())
+                .ok_or(ApiError::Window {
+                    reason: format!(
+                        "failed to build screenshot image buffer {}x{}",
+                        source_extent.width, source_extent.height
+                    ),
+                })?;
+        image::imageops::resize(
+            &image,
+            output_extent.width,
+            output_extent.height,
+            image::imageops::FilterType::CatmullRom,
+        )
+        .into_raw()
+    };
+    spawn_screenshot_write(output_rgba, output_extent, path.to_path_buf());
+    Ok(())
+}
+
+fn spawn_screenshot_write(rgba: Vec<u8>, extent: vk::Extent2D, path: PathBuf) {
+    thread::spawn(move || {
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "failed to create screenshot directory {}: {err}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+
+        if let Err(err) = image::save_buffer_with_format(
+            &path,
+            &rgba,
+            extent.width,
+            extent.height,
+            ColorType::Rgba8,
+            ImageFormat::Png,
+        ) {
+            eprintln!("failed to write screenshot {}: {err}", path.display());
+        }
+    });
+}
+
+fn accumulate_screenshot_rgba(accumulator: &mut [f32], rgba: &[u8]) {
+    for (dst, src) in accumulator.iter_mut().zip(rgba.iter()) {
+        *dst += *src as f32;
+    }
+}
+
+fn resolve_accumulated_screenshot_rgba(accumulator: &[f32], sample_count: u32) -> Vec<u8> {
+    let scale = 1.0 / sample_count.max(1) as f32;
+    accumulator
+        .iter()
+        .map(|value| (value * scale).clamp(0.0, 255.0).round() as u8)
+        .collect()
+}
+
+fn screenshot_output_extent(resolution: ScreenshotResolution) -> vk::Extent2D {
+    let [width, height] = resolution.extent();
+    vk::Extent2D { width, height }
 }
 
 fn create_buffer(
@@ -4113,20 +5494,57 @@ fn build_gpu_scene_cubes(meshes: &[MeshDraw3D]) -> Vec<GpuSceneCube> {
         .cloned()
         .map(|mesh| {
             let axes = cube_axes(mesh.rotation_radians);
+            let thin_slab = is_thin_cube_slab(&mesh);
+            let occlusion_weight = match mesh.mesh {
+                Mesh3D::Plane => 0.28,
+                Mesh3D::Cube if thin_slab => 0.14,
+                Mesh3D::Cube
+                | Mesh3D::Sphere
+                | Mesh3D::Custom(_)
+                | Mesh3D::Cylinder { .. }
+                | Mesh3D::Torus { .. }
+                | Mesh3D::Cone { .. }
+                | Mesh3D::Capsule { .. }
+                | Mesh3D::Icosphere { .. } => 1.0,
+            };
             GpuSceneCube {
-                center: [mesh.center[0], mesh.center[1], mesh.center[2], 0.0],
+                center: [
+                    mesh.center[0],
+                    mesh.center[1],
+                    mesh.center[2],
+                    occlusion_weight,
+                ],
                 half_extents: [
                     mesh.size[0] * 0.5,
                     mesh.size[1] * 0.5,
                     mesh.size[2] * 0.5,
                     0.0,
                 ],
-                axis_x: [axes[0][0], axes[0][1], axes[0][2], 0.0],
+                axis_x: [
+                    axes[0][0],
+                    axes[0][1],
+                    axes[0][2],
+                    if matches!(mesh.mesh, Mesh3D::Plane | Mesh3D::Torus { .. }) || thin_slab {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                ],
                 axis_y: [axes[1][0], axes[1][1], axes[1][2], 0.0],
                 axis_z: [axes[2][0], axes[2][1], axes[2][2], 0.0],
             }
         })
         .collect()
+}
+
+fn is_thin_cube_slab(mesh: &MeshDraw3D) -> bool {
+    if !matches!(mesh.mesh, Mesh3D::Cube) {
+        return false;
+    }
+
+    let min_extent = mesh.size[0].min(mesh.size[1]).min(mesh.size[2]);
+    let max_extent = mesh.size[0].max(mesh.size[1]).max(mesh.size[2]);
+    min_extent <= 0.16 && max_extent >= 1.5
 }
 
 fn cube_axes(rotation_radians: [f32; 3]) -> [[f32; 3]; 3] {
@@ -4179,12 +5597,38 @@ fn cube_view_projection_as_bytes(push_constants: &CubeViewProjectionPushConstant
     }
 }
 
-fn perspective_lh(fov_y_radians: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
+fn screenshot_camera_jitter(sample_index: u32, extent: vk::Extent2D) -> [f32; 2] {
+    let pixel_jitter_x = halton(sample_index + 1, 2) - 0.5;
+    let pixel_jitter_y = halton(sample_index + 1, 3) - 0.5;
+    [
+        (pixel_jitter_x * 2.0) / extent.width.max(1) as f32,
+        (pixel_jitter_y * 2.0) / extent.height.max(1) as f32,
+    ]
+}
+
+fn halton(mut index: u32, base: u32) -> f32 {
+    let mut result = 0.0;
+    let mut fraction = 1.0 / base as f32;
+    while index > 0 {
+        result += fraction * (index % base) as f32;
+        index /= base;
+        fraction /= base as f32;
+    }
+    result
+}
+
+fn perspective_lh(
+    fov_y_radians: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+    jitter_ndc: [f32; 2],
+) -> [[f32; 4]; 4] {
     let f = 1.0 / (fov_y_radians * 0.5).tan();
     let range = far - near;
     [
-        [f / aspect.max(0.0001), 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
+        [f / aspect.max(0.0001), 0.0, jitter_ndc[0], 0.0],
+        [0.0, f, jitter_ndc[1], 0.0],
         [0.0, 0.0, far / range, (-near * far) / range],
         [0.0, 0.0, 1.0, 0.0],
     ]
@@ -4214,6 +5658,121 @@ fn mul_mat4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
         }
     }
     out
+}
+
+fn orthographic_lh(
+    left: f32,
+    right: f32,
+    bottom: f32,
+    top: f32,
+    near: f32,
+    far: f32,
+) -> [[f32; 4]; 4] {
+    let width = (right - left).max(0.0001);
+    let height = (top - bottom).max(0.0001);
+    let depth = (far - near).max(0.0001);
+    [
+        [2.0 / width, 0.0, 0.0, -(right + left) / width],
+        [0.0, 2.0 / height, 0.0, -(top + bottom) / height],
+        [0.0, 0.0, 1.0 / depth, -near / depth],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn transform_point_mat4(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
+    let world = [point[0], point[1], point[2], 1.0];
+    [
+        matrix[0][0] * world[0] + matrix[0][1] * world[1] + matrix[0][2] * world[2] + matrix[0][3],
+        matrix[1][0] * world[0] + matrix[1][1] * world[1] + matrix[1][2] * world[2] + matrix[1][3],
+        matrix[2][0] * world[0] + matrix[2][1] * world[1] + matrix[2][2] * world[2] + matrix[2][3],
+    ]
+}
+
+fn compute_directional_shadow_view_projection(
+    meshes: &[MeshDraw3D],
+    camera: Camera3D,
+    lighting: LightingConfig,
+    max_distance: f32,
+) -> [[f32; 4]; 4] {
+    let light_dir = normalize3(lighting.fill_light.direction);
+    let mut min_world = [f32::INFINITY; 3];
+    let mut max_world = [f32::NEG_INFINITY; 3];
+    let mut any = false;
+
+    for mesh in meshes {
+        let half = [mesh.size[0] * 0.5, mesh.size[1] * 0.5, mesh.size[2] * 0.5];
+        let corners = [
+            [-half[0], -half[1], -half[2]],
+            [half[0], -half[1], -half[2]],
+            [half[0], half[1], -half[2]],
+            [-half[0], half[1], -half[2]],
+            [-half[0], -half[1], half[2]],
+            [half[0], -half[1], half[2]],
+            [half[0], half[1], half[2]],
+            [-half[0], half[1], half[2]],
+        ];
+        for corner in corners {
+            let world = add3(rotate_vector_3d(corner, mesh.rotation_radians), mesh.center);
+            min_world[0] = min_world[0].min(world[0]);
+            min_world[1] = min_world[1].min(world[1]);
+            min_world[2] = min_world[2].min(world[2]);
+            max_world[0] = max_world[0].max(world[0]);
+            max_world[1] = max_world[1].max(world[1]);
+            max_world[2] = max_world[2].max(world[2]);
+            any = true;
+        }
+    }
+
+    if !any {
+        min_world = [-2.0, -2.0, -2.0];
+        max_world = [2.0, 2.0, 2.0];
+    }
+
+    let center = scale3(add3(min_world, max_world), 0.5);
+    let radius = length3(sub3(max_world, min_world))
+        .min(max_distance.max(6.0))
+        .max(6.0);
+    let eye = sub3(center, scale3(light_dir, radius));
+    let up = if light_dir[1].abs() > 0.95 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let view = look_at_lh(eye, center, up);
+
+    let bounds_corners = [
+        [min_world[0], min_world[1], min_world[2]],
+        [max_world[0], min_world[1], min_world[2]],
+        [max_world[0], max_world[1], min_world[2]],
+        [min_world[0], max_world[1], min_world[2]],
+        [min_world[0], min_world[1], max_world[2]],
+        [max_world[0], min_world[1], max_world[2]],
+        [max_world[0], max_world[1], max_world[2]],
+        [min_world[0], max_world[1], max_world[2]],
+        camera.position,
+        camera.target,
+    ];
+    let mut min_light = [f32::INFINITY; 3];
+    let mut max_light = [f32::NEG_INFINITY; 3];
+    for corner in bounds_corners {
+        let light_space = transform_point_mat4(view, corner);
+        min_light[0] = min_light[0].min(light_space[0]);
+        min_light[1] = min_light[1].min(light_space[1]);
+        min_light[2] = min_light[2].min(light_space[2]);
+        max_light[0] = max_light[0].max(light_space[0]);
+        max_light[1] = max_light[1].max(light_space[1]);
+        max_light[2] = max_light[2].max(light_space[2]);
+    }
+    let margin = 2.0;
+    let projection = orthographic_lh(
+        min_light[0] - margin,
+        max_light[0] + margin,
+        min_light[1] - margin,
+        max_light[1] + margin,
+        (min_light[2] - margin).max(0.1),
+        max_light[2] + margin,
+    );
+    mul_mat4(projection, view)
 }
 
 fn rotate_vector_3d(vector: [f32; 3], rotation_radians: [f32; 3]) -> [f32; 3] {
@@ -4306,6 +5865,7 @@ mod tests {
                 960.0 / 640.0,
                 camera.near_clip,
                 camera.far_clip,
+                [0.0, 0.0],
             ),
             look_at_lh(camera.position, camera.target, camera.up),
         );
@@ -4331,7 +5891,7 @@ mod tests {
             material: Default::default(),
         });
 
-        let (vertices, _, _, _, _) = build_mesh_vertices(
+        let (vertices, _, _, _, _, _) = build_mesh_vertices(
             &frame,
             Camera3D::default(),
             LightingConfig::default(),
@@ -4339,6 +5899,7 @@ mod tests {
                 width: 960,
                 height: 640,
             },
+            [0.0, 0.0],
         );
 
         assert!(
@@ -4360,7 +5921,7 @@ mod tests {
             material: Default::default(),
         });
 
-        let (vertices, batches, _, _, _) = build_mesh_vertices(
+        let (vertices, batches, _, _, _, _) = build_mesh_vertices(
             &frame,
             Camera3D::default(),
             LightingConfig::default(),
@@ -4368,6 +5929,7 @@ mod tests {
                 width: 960,
                 height: 640,
             },
+            [0.0, 0.0],
         );
 
         assert!(
@@ -4385,11 +5947,13 @@ mod tests {
         frame.draw_mesh_3d(MeshDraw3D {
             material: crate::scene::MeshMaterial3D {
                 albedo_texture: Some(TextureHandle(9)),
+                roughness: 0.5,
+                metallic: 0.0,
             },
             ..MeshDraw3D::default()
         });
 
-        let (_, batches, _, _, _) = build_mesh_vertices(
+        let (_, batches, _, _, _, _) = build_mesh_vertices(
             &frame,
             Camera3D::default(),
             LightingConfig::default(),
@@ -4397,6 +5961,7 @@ mod tests {
                 width: 960,
                 height: 640,
             },
+            [0.0, 0.0],
         );
 
         assert_eq!(batches.len(), 1);

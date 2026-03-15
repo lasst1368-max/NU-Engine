@@ -1,3 +1,9 @@
+pub mod world;
+
+use crate::event::{EngineEvent, EventBus, EventDeliveryMode, ResourceEventKind};
+use crate::lighting::ShadowMode;
+use crate::physics::{BodyHandle, ColliderShape, PhysicsConfig, PhysicsWorld, RigidBody};
+use crate::resource::{AssetHandle, AssetKind, AssetManager, AssetState};
 use crate::scene::{MeshAsset3D, MeshVertex3D};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use shaderc::{CompileOptions, Compiler, EnvVersion, OptimizationLevel, ShaderKind, TargetEnv};
@@ -9,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use tobj::LoadOptions;
+use world::NuSceneWorld;
 
 pub const NU_SCENE_EXTENSION: &str = "nuscene";
 pub const NU_SCENE_FORMAT_HEADER: &str = "# nu scene format v1";
@@ -62,6 +69,9 @@ transform.scale = 1.0, 1.0, 1.0
 # transform.position = 2.0, 1.0, 0.0
 # transform.rotation_degrees = 0.0, 0.0, 0.0
 # transform.scale = 1.0, 1.0, 1.0
+# script.na = scripts/player_controller.na
+# script.cpp = scripts/player_controller.cpp
+# script.player_camera = true
 #
 # Example parented mesh:
 # [mesh.wheel]
@@ -75,12 +85,16 @@ transform.scale = 1.0, 1.0, 1.0
 [environment]
 ambient_color = 0.1, 0.1, 0.15
 ambient_intensity = 0.3
+shadow_mode = live
+shadow_max_distance = 32.0
+shadow_filter_radius = 1.5
 
 [material.red_material]
 shader.vertex = lit.vert
 shader.fragment = lit.frag
 color = 1.0, 0.0, 0.0
 roughness = 0.5
+metallic = 0.0
 albedo_texture = crate.png
 
 # [material.wheel_material]
@@ -88,6 +102,7 @@ albedo_texture = crate.png
 # shader.fragment = lit.frag
 # color = 0.15, 0.15, 0.15
 # roughness = 0.7
+# metallic = 0.0
 "#;
 
 #[derive(Debug)]
@@ -225,6 +240,7 @@ pub struct NuLightSection {
     pub position: [f32; 3],
     pub color: [f32; 3],
     pub intensity: f32,
+    pub casts_shadow: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -244,6 +260,62 @@ impl Default for NuTransform {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NuPhysicsBodyKind {
+    Static,
+    Dynamic,
+    Kinematic,
+}
+
+impl NuPhysicsBodyKind {
+    fn parse(value: &str) -> Result<Self, EngineError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "static" => Ok(Self::Static),
+            "dynamic" => Ok(Self::Dynamic),
+            "kinematic" => Ok(Self::Kinematic),
+            other => Err(EngineError::InvalidScene {
+                reason: format!("unsupported physics body `{other}`"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NuPhysicsColliderKind {
+    Auto,
+    Cuboid,
+    Sphere,
+    Plane,
+}
+
+impl NuPhysicsColliderKind {
+    fn parse(value: &str) -> Result<Self, EngineError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "cuboid" => Ok(Self::Cuboid),
+            "sphere" => Ok(Self::Sphere),
+            "plane" => Ok(Self::Plane),
+            other => Err(EngineError::InvalidScene {
+                reason: format!("unsupported physics collider `{other}`"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NuPhysicsSection {
+    pub body: NuPhysicsBodyKind,
+    pub collider: NuPhysicsColliderKind,
+    pub mass: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NuMeshScriptSection {
+    pub na_script: Option<PathBuf>,
+    pub cpp_script: Option<PathBuf>,
+    pub player_camera: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NuMeshSection {
     pub name: String,
@@ -252,6 +324,9 @@ pub struct NuMeshSection {
     pub material: String,
     pub parent: Option<String>,
     pub transform: NuTransform,
+    pub pivot_offset: [f32; 3],
+    pub physics: Option<NuPhysicsSection>,
+    pub script: Option<NuMeshScriptSection>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +336,7 @@ pub struct NuMaterialSection {
     pub shader_fragment: PathBuf,
     pub color: [f32; 3],
     pub roughness: f32,
+    pub metallic: f32,
     pub albedo_texture: Option<PathBuf>,
 }
 
@@ -268,6 +344,9 @@ pub struct NuMaterialSection {
 pub struct NuEnvironmentSection {
     pub ambient_color: [f32; 3],
     pub ambient_intensity: f32,
+    pub shadow_mode: ShadowMode,
+    pub shadow_max_distance: f32,
+    pub shadow_filter_radius: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -281,7 +360,166 @@ pub struct NuSceneDocument {
     pub materials: BTreeMap<String, NuMaterialSection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NuResolvedTransform {
+    position: [f32; 3],
+    rotation_degrees: [f32; 3],
+    scale: [f32; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NuScenePhysicsBinding {
+    pub mesh_name: String,
+    pub body_handle: BodyHandle,
+}
+
+#[derive(Debug)]
+pub struct NuScenePhysicsRuntime {
+    world: PhysicsWorld,
+    bindings: Vec<NuScenePhysicsBinding>,
+}
+
+impl NuScenePhysicsRuntime {
+    pub fn from_scene(scene: &NuSceneDocument) -> Result<Self, EngineError> {
+        Self::from_scene_with_config(scene, PhysicsConfig::default())
+    }
+
+    pub fn from_scene_with_config(
+        scene: &NuSceneDocument,
+        config: PhysicsConfig,
+    ) -> Result<Self, EngineError> {
+        let mut world = PhysicsWorld::new(config);
+        let mut bindings = Vec::new();
+
+        for (mesh_name, mesh) in &scene.meshes {
+            let Some(physics) = &mesh.physics else {
+                continue;
+            };
+            let resolved = resolve_mesh_world_transform(scene, mesh_name, 0)?;
+            let collider = collider_from_mesh(mesh_name, mesh, physics, resolved)?;
+            let body = rigid_body_from_mesh(mesh, physics, resolved, collider);
+            let body_handle = world.insert_body(body);
+            bindings.push(NuScenePhysicsBinding {
+                mesh_name: mesh_name.clone(),
+                body_handle,
+            });
+        }
+
+        Ok(Self { world, bindings })
+    }
+
+    pub fn world(&self) -> &PhysicsWorld {
+        &self.world
+    }
+
+    pub fn world_mut(&mut self) -> &mut PhysicsWorld {
+        &mut self.world
+    }
+
+    pub fn bindings(&self) -> &[NuScenePhysicsBinding] {
+        &self.bindings
+    }
+
+    pub fn body_for_mesh(&self, mesh_name: &str) -> Option<(BodyHandle, &RigidBody)> {
+        let binding = self
+            .bindings
+            .iter()
+            .find(|binding| binding.mesh_name.eq_ignore_ascii_case(mesh_name))?;
+        Some((binding.body_handle, self.world.body(binding.body_handle)?))
+    }
+
+    pub fn step(&mut self, delta_time_seconds: f32) {
+        self.world.step(delta_time_seconds);
+    }
+
+    pub fn sync_to_scene(&self, scene: &mut NuSceneDocument) -> Result<(), EngineError> {
+        let updates = self.collect_scene_updates(scene)?;
+        for (mesh_name, position, rotation_degrees) in updates {
+            let Some(mesh) = scene.meshes.get_mut(&mesh_name) else {
+                continue;
+            };
+            mesh.transform.position = position;
+            mesh.transform.rotation_degrees = rotation_degrees;
+        }
+        Ok(())
+    }
+
+    fn collect_scene_updates(
+        &self,
+        scene: &NuSceneDocument,
+    ) -> Result<Vec<(String, [f32; 3], [f32; 3])>, EngineError> {
+        let mut updates = Vec::with_capacity(self.bindings.len());
+        for binding in &self.bindings {
+            let Some(body) = self.world.body(binding.body_handle) else {
+                continue;
+            };
+            let Some(mesh) = scene.meshes.get(&binding.mesh_name) else {
+                continue;
+            };
+            let parent_transform = match &mesh.parent {
+                Some(parent) => {
+                    let Some(parent_name) = parent.strip_prefix("mesh.") else {
+                        return Err(EngineError::InvalidScene {
+                            reason: format!(
+                                "mesh `{}` has invalid parent `{parent}`; expected `mesh.<name>`",
+                                mesh.name
+                            ),
+                        });
+                    };
+                    Some(resolve_mesh_world_transform(scene, parent_name, 0)?)
+                }
+                None => None,
+            };
+            let local_position = parent_transform
+                .map_or(body.position, |parent| sub3(body.position, parent.position));
+            let local_rotation_degrees =
+                parent_transform.map_or(radians3_to_degrees(body.rotation_radians), |parent| {
+                    sub3(
+                        radians3_to_degrees(body.rotation_radians),
+                        parent.rotation_degrees,
+                    )
+                });
+            updates.push((
+                binding.mesh_name.clone(),
+                local_position,
+                local_rotation_degrees,
+            ));
+        }
+        Ok(updates)
+    }
+}
+
+pub fn build_scene_physics_runtime(
+    scene: &NuSceneDocument,
+) -> Result<NuScenePhysicsRuntime, EngineError> {
+    NuScenePhysicsRuntime::from_scene(scene)
+}
+
+pub fn build_scene_physics_runtime_with_config(
+    scene: &NuSceneDocument,
+    config: PhysicsConfig,
+) -> Result<NuScenePhysicsRuntime, EngineError> {
+    NuScenePhysicsRuntime::from_scene_with_config(scene, config)
+}
+
+pub fn build_scene_world(scene: &NuSceneDocument) -> Result<NuSceneWorld, EngineError> {
+    NuSceneWorld::from_document(scene)
+}
+
+pub fn register_scene_assets(
+    scene: &NuSceneDocument,
+    scene_path: impl AsRef<Path>,
+    asset_manager: &mut AssetManager,
+) -> SceneAssetBindings {
+    let references = scene.asset_references(scene_path);
+    register_scene_assets_from_references(&references, asset_manager)
+}
+
 impl NuSceneDocument {
+    pub fn compile_world(&self) -> Result<NuSceneWorld, EngineError> {
+        NuSceneWorld::from_document(self)
+    }
+
     pub fn asset_references(&self, scene_path: impl AsRef<Path>) -> SceneAssetReferences {
         let scene_path = scene_path.as_ref();
         let base_dir = scene_path.parent().unwrap_or_else(|| Path::new("."));
@@ -338,6 +576,38 @@ pub struct SceneAssetReferences {
     pub meshes: BTreeMap<String, PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShaderProgramAssetHandles {
+    pub vertex: AssetHandle,
+    pub fragment: AssetHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneAssetBindings {
+    pub scene: AssetHandle,
+    pub shader_programs: BTreeMap<String, ShaderProgramAssetHandles>,
+    pub textures: BTreeMap<String, AssetHandle>,
+    pub meshes: BTreeMap<String, AssetHandle>,
+}
+
+impl SceneAssetBindings {
+    fn unique_handles(&self) -> HashSet<AssetHandle> {
+        let mut handles = HashSet::new();
+        handles.insert(self.scene);
+        for shader in self.shader_programs.values() {
+            handles.insert(shader.vertex);
+            handles.insert(shader.fragment);
+        }
+        for handle in self.textures.values() {
+            handles.insert(*handle);
+        }
+        for handle in self.meshes.values() {
+            handles.insert(*handle);
+        }
+        handles
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShaderStage {
     Vertex,
@@ -372,6 +642,8 @@ pub struct HotReloadManager {
     scene_path: PathBuf,
     scene: NuSceneDocument,
     assets: SceneAssetReferences,
+    asset_manager: AssetManager,
+    asset_bindings: SceneAssetBindings,
     watched_paths: HashSet<PathBuf>,
     watcher: RecommendedWatcher,
     events: Receiver<Result<Event, notify::Error>>,
@@ -382,6 +654,8 @@ impl HotReloadManager {
         let scene_path = normalize_asset_path(scene_path.as_ref().to_path_buf());
         let scene = load_scene_file(&scene_path)?;
         let assets = scene.asset_references(&scene_path);
+        let mut asset_manager = AssetManager::default();
+        let asset_bindings = register_scene_assets_from_references(&assets, &mut asset_manager);
         let (tx, rx) = mpsc::channel();
         let watcher = notify::recommended_watcher(move |event| {
             let _ = tx.send(event);
@@ -390,6 +664,8 @@ impl HotReloadManager {
             scene_path,
             scene,
             assets,
+            asset_manager,
+            asset_bindings,
             watched_paths: HashSet::new(),
             watcher,
             events: rx,
@@ -406,9 +682,23 @@ impl HotReloadManager {
         &self.assets
     }
 
+    pub fn asset_manager(&self) -> &AssetManager {
+        &self.asset_manager
+    }
+
+    pub fn asset_bindings(&self) -> &SceneAssetBindings {
+        &self.asset_bindings
+    }
+
     pub fn reload_now(&mut self) -> Result<ReloadBatch, EngineError> {
         let scene = load_scene_file(&self.scene_path)?;
-        self.assets = scene.asset_references(&self.scene_path);
+        let references = scene.asset_references(&self.scene_path);
+        self.asset_bindings = sync_scene_assets(
+            &mut self.asset_manager,
+            Some(&self.asset_bindings),
+            &references,
+        );
+        self.assets = references;
         self.scene = scene.clone();
         self.sync_watched_paths()?;
 
@@ -450,6 +740,16 @@ impl HotReloadManager {
         })
     }
 
+    pub fn reload_now_with_events(
+        &mut self,
+        event_bus: &mut EventBus,
+        delivery: EventDeliveryMode,
+    ) -> Result<ReloadBatch, EngineError> {
+        let batch = self.reload_now()?;
+        publish_reload_batch_events(&batch, event_bus, delivery);
+        Ok(batch)
+    }
+
     pub fn poll_changes(&mut self) -> Result<Option<ReloadBatch>, EngineError> {
         let mut changed = BTreeSet::new();
         while let Ok(event) = self.events.try_recv() {
@@ -471,7 +771,13 @@ impl HotReloadManager {
         let mut updated_scene = None;
         if scene_changed {
             let scene = load_scene_file(&self.scene_path)?;
-            self.assets = scene.asset_references(&self.scene_path);
+            let references = scene.asset_references(&self.scene_path);
+            self.asset_bindings = sync_scene_assets(
+                &mut self.asset_manager,
+                Some(&self.asset_bindings),
+                &references,
+            );
+            self.assets = references;
             self.scene = scene.clone();
             self.sync_watched_paths()?;
             updated_scene = Some(scene);
@@ -519,6 +825,18 @@ impl HotReloadManager {
         }))
     }
 
+    pub fn poll_changes_with_events(
+        &mut self,
+        event_bus: &mut EventBus,
+        delivery: EventDeliveryMode,
+    ) -> Result<Option<ReloadBatch>, EngineError> {
+        let batch = self.poll_changes()?;
+        if let Some(batch) = &batch {
+            publish_reload_batch_events(batch, event_bus, delivery);
+        }
+        Ok(batch)
+    }
+
     fn sync_watched_paths(&mut self) -> Result<(), EngineError> {
         let mut desired = HashSet::new();
         desired.insert(self.assets.scene_path.clone());
@@ -544,6 +862,46 @@ impl HotReloadManager {
             }
         }
         Ok(())
+    }
+}
+
+pub fn publish_reload_batch_events(
+    batch: &ReloadBatch,
+    event_bus: &mut EventBus,
+    delivery: EventDeliveryMode,
+) {
+    if let Some(scene) = &batch.scene {
+        event_bus.publish(
+            EngineEvent::SceneLoaded {
+                scene_name: scene.scene.name.clone(),
+            },
+            delivery,
+        );
+        event_bus.publish(
+            EngineEvent::ResourceReloaded {
+                kind: ResourceEventKind::Scene,
+                resource_id: scene.scene.name.clone(),
+            },
+            delivery,
+        );
+    }
+    for shader in &batch.shaders {
+        event_bus.publish(
+            EngineEvent::ResourceReloaded {
+                kind: ResourceEventKind::Shader,
+                resource_id: shader.path.display().to_string(),
+            },
+            delivery,
+        );
+    }
+    for texture in &batch.textures {
+        event_bus.publish(
+            EngineEvent::ResourceReloaded {
+                kind: ResourceEventKind::Texture,
+                resource_id: texture.path.display().to_string(),
+            },
+            delivery,
+        );
     }
 }
 
@@ -609,6 +967,7 @@ pub fn parse_scene_str(source: &str) -> Result<NuSceneDocument, EngineError> {
                     position: required_vec3(table, "position")?,
                     color: required_vec3(table, "color")?,
                     intensity: required_number(table, "intensity")?,
+                    casts_shadow: optional_bool(table, "casts_shadow").unwrap_or(true),
                 },
             );
         }
@@ -639,6 +998,9 @@ pub fn parse_scene_str(source: &str) -> Result<NuSceneDocument, EngineError> {
                         rotation_degrees: parse_rotation_degrees(table),
                         scale: optional_vec3(table, "transform.scale").unwrap_or([1.0, 1.0, 1.0]),
                     },
+                    pivot_offset: optional_vec3(table, "pivot.offset").unwrap_or([0.0, 0.0, 0.0]),
+                    physics: parse_optional_physics(table)?,
+                    script: parse_optional_script(table),
                 },
             );
         }
@@ -661,18 +1023,28 @@ pub fn parse_scene_str(source: &str) -> Result<NuSceneDocument, EngineError> {
                     shader_fragment,
                     color: optional_vec3(table, "color").unwrap_or([1.0, 1.0, 1.0]),
                     roughness: optional_number(table, "roughness").unwrap_or(0.5),
+                    metallic: optional_number(table, "metallic").unwrap_or(0.0),
                     albedo_texture: optional_string(table, "albedo_texture").map(PathBuf::from),
                 },
             );
         }
     }
 
-    let environment = sections
-        .get("environment")
-        .map(|table| NuEnvironmentSection {
+    let environment = if let Some(table) = sections.get("environment") {
+        Some(NuEnvironmentSection {
             ambient_color: optional_vec3(table, "ambient_color").unwrap_or([0.05, 0.05, 0.07]),
             ambient_intensity: optional_number(table, "ambient_intensity").unwrap_or(1.0),
-        });
+            shadow_mode: optional_string(table, "shadow_mode")
+                .as_deref()
+                .map(parse_shadow_mode)
+                .transpose()?
+                .unwrap_or(ShadowMode::Live),
+            shadow_max_distance: optional_number(table, "shadow_max_distance").unwrap_or(32.0),
+            shadow_filter_radius: optional_number(table, "shadow_filter_radius").unwrap_or(1.5),
+        })
+    } else {
+        None
+    };
 
     validate_mesh_sections(&meshes)?;
 
@@ -1052,6 +1424,18 @@ fn optional_vec3(table: &BTreeMap<String, SceneValue>, key: &str) -> Option<[f32
     }
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn optional_bool(table: &BTreeMap<String, SceneValue>, key: &str) -> Option<bool> {
+    optional_string(table, key).and_then(|value| parse_bool(&value))
+}
+
 fn parse_rotation_degrees(table: &BTreeMap<String, SceneValue>) -> [f32; 3] {
     if let Some(value) = optional_vec3(table, "transform.rotation_degrees") {
         return value;
@@ -1064,6 +1448,55 @@ fn parse_rotation_degrees(table: &BTreeMap<String, SceneValue>) -> [f32; 3] {
         ];
     }
     optional_vec3(table, "transform.rotation").unwrap_or([0.0, 0.0, 0.0])
+}
+
+fn parse_optional_physics(
+    table: &BTreeMap<String, SceneValue>,
+) -> Result<Option<NuPhysicsSection>, EngineError> {
+    let body = optional_string(table, "physics.body");
+    let collider = optional_string(table, "physics.collider");
+    let mass = optional_number(table, "physics.mass");
+    if body.is_none() && collider.is_none() && mass.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(NuPhysicsSection {
+        body: body
+            .as_deref()
+            .map(NuPhysicsBodyKind::parse)
+            .transpose()?
+            .unwrap_or(NuPhysicsBodyKind::Static),
+        collider: collider
+            .as_deref()
+            .map(NuPhysicsColliderKind::parse)
+            .transpose()?
+            .unwrap_or(NuPhysicsColliderKind::Auto),
+        mass: mass.unwrap_or(1.0).max(0.0001),
+    }))
+}
+
+fn parse_optional_script(table: &BTreeMap<String, SceneValue>) -> Option<NuMeshScriptSection> {
+    let na_script = optional_string(table, "script.na").map(PathBuf::from);
+    let cpp_script = optional_string(table, "script.cpp").map(PathBuf::from);
+    let player_camera = optional_bool(table, "script.player_camera").unwrap_or(false);
+    if na_script.is_none() && cpp_script.is_none() && !player_camera {
+        None
+    } else {
+        Some(NuMeshScriptSection {
+            na_script,
+            cpp_script,
+            player_camera,
+        })
+    }
+}
+
+fn parse_shadow_mode(value: &str) -> Result<ShadowMode, EngineError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(ShadowMode::Off),
+        "live" => Ok(ShadowMode::Live),
+        other => Err(EngineError::InvalidScene {
+            reason: format!("unsupported shadow mode `{other}`"),
+        }),
+    }
 }
 
 fn optional_string_list(table: &BTreeMap<String, SceneValue>, key: &str) -> Option<Vec<String>> {
@@ -1149,6 +1582,131 @@ fn normalize_asset_path(path: PathBuf) -> PathBuf {
     fs::canonicalize(&path).unwrap_or(path)
 }
 
+fn resolve_mesh_world_transform(
+    scene: &NuSceneDocument,
+    mesh_name: &str,
+    depth: usize,
+) -> Result<NuResolvedTransform, EngineError> {
+    if depth >= 32 {
+        return Err(EngineError::InvalidScene {
+            reason: format!("mesh `{mesh_name}` parent chain is too deep"),
+        });
+    }
+    let mesh = scene
+        .meshes
+        .get(mesh_name)
+        .ok_or_else(|| EngineError::InvalidScene {
+            reason: format!("mesh `{mesh_name}` is missing from scene"),
+        })?;
+    let mut resolved = NuResolvedTransform {
+        position: mesh.transform.position,
+        rotation_degrees: mesh.transform.rotation_degrees,
+        scale: mesh.transform.scale,
+    };
+    if let Some(parent) = &mesh.parent {
+        let Some(parent_name) = parent.strip_prefix("mesh.") else {
+            return Err(EngineError::InvalidScene {
+                reason: format!(
+                    "mesh `{mesh_name}` has invalid parent `{parent}`; expected `mesh.<name>`"
+                ),
+            });
+        };
+        let parent = resolve_mesh_world_transform(scene, parent_name, depth + 1)?;
+        resolved.position = add3(parent.position, resolved.position);
+        resolved.rotation_degrees = add3(parent.rotation_degrees, resolved.rotation_degrees);
+        resolved.scale = mul3(parent.scale, resolved.scale);
+    }
+    Ok(resolved)
+}
+
+fn collider_from_mesh(
+    _mesh_name: &str,
+    mesh: &NuMeshSection,
+    physics: &NuPhysicsSection,
+    resolved: NuResolvedTransform,
+) -> Result<ColliderShape, EngineError> {
+    let geometry = mesh.geometry.trim().to_ascii_lowercase();
+    let collider_kind = match physics.collider {
+        NuPhysicsColliderKind::Auto => match geometry.as_str() {
+            "sphere" => NuPhysicsColliderKind::Sphere,
+            "plane" => NuPhysicsColliderKind::Plane,
+            _ => NuPhysicsColliderKind::Cuboid,
+        },
+        kind => kind,
+    };
+    match collider_kind {
+        NuPhysicsColliderKind::Auto => unreachable!(),
+        NuPhysicsColliderKind::Cuboid => Ok(ColliderShape::Cuboid {
+            half_extents: [
+                resolved.scale[0].abs() * 0.5,
+                resolved.scale[1].abs() * 0.5,
+                resolved.scale[2].abs() * 0.5,
+            ],
+        }),
+        NuPhysicsColliderKind::Sphere => {
+            let radius = resolved.scale[0]
+                .abs()
+                .max(resolved.scale[1].abs())
+                .max(resolved.scale[2].abs())
+                * 0.5;
+            Ok(ColliderShape::Sphere { radius })
+        }
+        NuPhysicsColliderKind::Plane => Ok(ColliderShape::Plane {
+            normal: [0.0, 1.0, 0.0],
+            offset: resolved.position[1],
+        }),
+    }
+}
+
+fn rigid_body_from_mesh(
+    mesh: &NuMeshSection,
+    physics: &NuPhysicsSection,
+    resolved: NuResolvedTransform,
+    collider: ColliderShape,
+) -> RigidBody {
+    let rotation_radians = degrees3_to_radians(resolved.rotation_degrees);
+    let mut body = match physics.body {
+        NuPhysicsBodyKind::Static => RigidBody::static_body(resolved.position, collider),
+        NuPhysicsBodyKind::Dynamic => {
+            RigidBody::dynamic_body(resolved.position, physics.mass.max(0.0001), collider)
+        }
+        NuPhysicsBodyKind::Kinematic => RigidBody::kinematic_body(resolved.position, collider),
+    };
+    body.rotation_radians = rotation_radians;
+    if mesh.geometry.eq_ignore_ascii_case("plane") {
+        body.angular_velocity = [0.0, 0.0, 0.0];
+    }
+    body
+}
+
+fn degrees3_to_radians(value: [f32; 3]) -> [f32; 3] {
+    [
+        value[0].to_radians(),
+        value[1].to_radians(),
+        value[2].to_radians(),
+    ]
+}
+
+fn radians3_to_degrees(value: [f32; 3]) -> [f32; 3] {
+    [
+        value[0].to_degrees(),
+        value[1].to_degrees(),
+        value[2].to_degrees(),
+    ]
+}
+
+fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn mul3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] * b[0], a[1] * b[1], a[2] * b[2]]
+}
+
 fn validate_mesh_sections(meshes: &BTreeMap<String, NuMeshSection>) -> Result<(), EngineError> {
     for (name, mesh) in meshes {
         validate_geometry_identifier(name, &mesh.geometry)?;
@@ -1156,6 +1714,9 @@ fn validate_mesh_sections(meshes: &BTreeMap<String, NuMeshSection>) -> Result<()
             return Err(EngineError::InvalidScene {
                 reason: format!("mesh `{name}` uses geometry `obj` but has no `source` path"),
             });
+        }
+        if let Some(physics) = &mesh.physics {
+            validate_mesh_physics(name, mesh, physics)?;
         }
         if let Some(parent) = &mesh.parent {
             let Some(parent_name) = parent.strip_prefix("mesh.") else {
@@ -1180,6 +1741,28 @@ fn validate_mesh_sections(meshes: &BTreeMap<String, NuMeshSection>) -> Result<()
     Ok(())
 }
 
+fn validate_mesh_physics(
+    mesh_name: &str,
+    mesh: &NuMeshSection,
+    physics: &NuPhysicsSection,
+) -> Result<(), EngineError> {
+    if matches!(physics.collider, NuPhysicsColliderKind::Plane)
+        && !mesh.geometry.eq_ignore_ascii_case("plane")
+    {
+        return Err(EngineError::InvalidScene {
+            reason: format!(
+                "mesh `{mesh_name}` uses physics collider `plane` but geometry is not `plane`"
+            ),
+        });
+    }
+    if matches!(physics.body, NuPhysicsBodyKind::Dynamic) && physics.mass <= 0.0 {
+        return Err(EngineError::InvalidScene {
+            reason: format!("mesh `{mesh_name}` uses dynamic physics but mass is not positive"),
+        });
+    }
+    Ok(())
+}
+
 fn validate_geometry_identifier(mesh_name: &str, geometry: &str) -> Result<(), EngineError> {
     match geometry.trim().to_ascii_lowercase().as_str() {
         "cube" | "plane" | "sphere" => Ok(()),
@@ -1192,9 +1775,101 @@ fn validate_geometry_identifier(mesh_name: &str, geometry: &str) -> Result<(), E
     }
 }
 
+fn register_scene_assets_from_references(
+    references: &SceneAssetReferences,
+    asset_manager: &mut AssetManager,
+) -> SceneAssetBindings {
+    let scene = register_asset_path(
+        asset_manager,
+        AssetKind::Scene,
+        &references.scene_path,
+        AssetState::Loaded,
+    );
+    let shader_programs = references
+        .shader_programs
+        .iter()
+        .map(|(material_name, paths)| {
+            let vertex = register_asset_path(
+                asset_manager,
+                AssetKind::Shader,
+                &paths.vertex,
+                AssetState::Loaded,
+            );
+            let fragment = register_asset_path(
+                asset_manager,
+                AssetKind::Shader,
+                &paths.fragment,
+                AssetState::Loaded,
+            );
+            (
+                material_name.clone(),
+                ShaderProgramAssetHandles { vertex, fragment },
+            )
+        })
+        .collect();
+    let textures = references
+        .textures
+        .iter()
+        .map(|(material_name, path)| {
+            (
+                material_name.clone(),
+                register_asset_path(asset_manager, AssetKind::Texture, path, AssetState::Loaded),
+            )
+        })
+        .collect();
+    let meshes = references
+        .meshes
+        .iter()
+        .map(|(mesh_name, path)| {
+            (
+                mesh_name.clone(),
+                register_asset_path(asset_manager, AssetKind::Mesh, path, AssetState::Loaded),
+            )
+        })
+        .collect();
+
+    SceneAssetBindings {
+        scene,
+        shader_programs,
+        textures,
+        meshes,
+    }
+}
+
+fn sync_scene_assets(
+    asset_manager: &mut AssetManager,
+    previous: Option<&SceneAssetBindings>,
+    next_references: &SceneAssetReferences,
+) -> SceneAssetBindings {
+    let next_bindings = register_scene_assets_from_references(next_references, asset_manager);
+    if let Some(previous) = previous {
+        for handle in previous.unique_handles() {
+            let _ = asset_manager.release(handle);
+        }
+    }
+    next_bindings
+}
+
+fn register_asset_path(
+    asset_manager: &mut AssetManager,
+    kind: AssetKind,
+    path: &Path,
+    state: AssetState,
+) -> AssetHandle {
+    let normalized = normalize_asset_path(path.to_path_buf());
+    let handle = asset_manager.register(
+        kind,
+        normalized.to_string_lossy().into_owned(),
+        Some(normalized),
+    );
+    let _ = asset_manager.mark_state(handle, state);
+    handle
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{EngineEvent, EventBus, EventDeliveryMode, ResourceEventKind};
 
     const SAMPLE_SCENE: &str = r#"# nu scene format v1
 # .nuscene
@@ -1341,6 +2016,9 @@ shader.fragment = lit.frag
             Some(NuEnvironmentSection {
                 ambient_color: [0.1, 0.1, 0.15],
                 ambient_intensity: 0.3,
+                shadow_mode: ShadowMode::Live,
+                shadow_max_distance: 32.0,
+                shadow_filter_radius: 1.5,
             })
         );
         assert_eq!(
@@ -1518,6 +2196,147 @@ shader.fragment = lit.frag
     }
 
     #[test]
+    fn scene_physics_runtime_builds_bodies_from_mesh_sections() {
+        let document = parse_scene_str(
+            r#"# nu scene format v1
+# .nuscene
+
+[scene]
+name = "physics_scene"
+syntax = opengl
+
+[camera]
+position = 0.0, 4.0, 8.0
+target = 0.0, 0.0, 0.0
+fov = 60.0
+
+[light.key]
+type = point
+position = 1.0, 4.0, 2.0
+color = 1.0, 1.0, 1.0
+intensity = 1.0
+
+[mesh.floor]
+geometry = plane
+material = red_material
+transform.position = 0.0, 0.0, 0.0
+transform.scale = 8.0, 1.0, 8.0
+physics.body = static
+physics.collider = plane
+physics.mass = 1.0
+
+[mesh.ball]
+geometry = sphere
+material = red_material
+transform.position = 0.0, 3.0, 0.0
+transform.scale = 2.0, 2.0, 2.0
+physics.body = dynamic
+physics.collider = auto
+physics.mass = 1.5
+
+[material.red_material]
+shader.vertex = lit.vert
+shader.fragment = lit.frag
+"#,
+        )
+        .expect("scene should parse");
+
+        let runtime = build_scene_physics_runtime(&document).expect("physics runtime should build");
+
+        assert_eq!(runtime.bindings().len(), 2);
+        let (_, floor) = runtime
+            .body_for_mesh("floor")
+            .expect("floor body should exist");
+        assert_eq!(floor.body_type, crate::physics::BodyType::Static);
+        assert_eq!(
+            floor.collider,
+            ColliderShape::Plane {
+                normal: [0.0, 1.0, 0.0],
+                offset: 0.0,
+            }
+        );
+
+        let (_, ball) = runtime
+            .body_for_mesh("ball")
+            .expect("ball body should exist");
+        assert_eq!(ball.body_type, crate::physics::BodyType::Dynamic);
+        assert_eq!(ball.position, [0.0, 3.0, 0.0]);
+        assert_eq!(ball.collider, ColliderShape::Sphere { radius: 1.0 });
+        assert!((ball.mass - 1.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn scene_physics_runtime_syncs_dynamic_body_back_into_scene_mesh() {
+        let mut document = parse_scene_str(
+            r#"# nu scene format v1
+# .nuscene
+
+[scene]
+name = "sync_scene"
+syntax = opengl
+
+[camera]
+position = 0.0, 4.0, 8.0
+target = 0.0, 0.0, 0.0
+fov = 60.0
+
+[light.key]
+type = point
+position = 1.0, 4.0, 2.0
+color = 1.0, 1.0, 1.0
+intensity = 1.0
+
+[mesh.root]
+geometry = cube
+material = red_material
+transform.position = 10.0, 0.0, 0.0
+transform.rotation_degrees = 10.0, 20.0, 30.0
+
+[mesh.child]
+geometry = cube
+material = red_material
+parent = mesh.root
+transform.position = 1.0, 2.0, 3.0
+transform.rotation_degrees = 5.0, 6.0, 7.0
+physics.body = kinematic
+physics.collider = cuboid
+physics.mass = 1.0
+
+[material.red_material]
+shader.vertex = lit.vert
+shader.fragment = lit.frag
+"#,
+        )
+        .expect("scene should parse");
+
+        let mut runtime =
+            build_scene_physics_runtime(&document).expect("physics runtime should build");
+        let (body_handle, _) = runtime
+            .body_for_mesh("child")
+            .expect("child body should exist");
+        let body = runtime
+            .world_mut()
+            .body_mut(body_handle)
+            .expect("body should still exist");
+        body.position = [15.0, 9.0, 5.0];
+        body.rotation_radians = [
+            45.0f32.to_radians(),
+            35.0f32.to_radians(),
+            15.0f32.to_radians(),
+        ];
+
+        runtime
+            .sync_to_scene(&mut document)
+            .expect("scene sync should succeed");
+
+        let child = &document.meshes["child"];
+        assert_eq!(child.transform.position, [5.0, 9.0, 5.0]);
+        assert!((child.transform.rotation_degrees[0] - 35.0).abs() < 0.01);
+        assert!((child.transform.rotation_degrees[1] - 15.0).abs() < 0.01);
+        assert!((child.transform.rotation_degrees[2] + 15.0).abs() < 0.01);
+    }
+
+    #[test]
     fn shader_stage_is_inferred_from_filename_suffix() {
         assert_eq!(
             shader_stage_from_path(Path::new("basic.vert")).unwrap(),
@@ -1526,6 +2345,121 @@ shader.fragment = lit.frag
         assert_eq!(
             shader_stage_from_path(Path::new("basic.frag.glsl")).unwrap(),
             ShaderStage::Fragment
+        );
+    }
+
+    #[test]
+    fn reload_batch_emits_scene_shader_and_texture_events() {
+        let scene = parse_scene_str(EXPLICIT_NUSCENE_TEMPLATE).expect("template should parse");
+        let batch = ReloadBatch {
+            changed_paths: vec![],
+            scene: Some(scene),
+            shaders: vec![ReloadedShader {
+                material_name: "red_material".to_string(),
+                path: PathBuf::from("lit.vert"),
+                stage: ShaderStage::Vertex,
+                spirv_words: vec![1, 2, 3],
+            }],
+            textures: vec![ReloadedTexture {
+                material_name: "red_material".to_string(),
+                path: PathBuf::from("crate.png"),
+                bytes: vec![1, 2, 3],
+            }],
+        };
+        let mut bus = EventBus::default();
+
+        publish_reload_batch_events(&batch, &mut bus, EventDeliveryMode::Queued);
+
+        assert_eq!(bus.queued_len(), 4);
+        let trace = bus.trace();
+        assert!(matches!(trace[0], EngineEvent::SceneLoaded { .. }));
+        assert!(matches!(
+            trace[1],
+            EngineEvent::ResourceReloaded {
+                kind: ResourceEventKind::Scene,
+                ..
+            }
+        ));
+        assert!(matches!(
+            trace[2],
+            EngineEvent::ResourceReloaded {
+                kind: ResourceEventKind::Shader,
+                ..
+            }
+        ));
+        assert!(matches!(
+            trace[3],
+            EngineEvent::ResourceReloaded {
+                kind: ResourceEventKind::Texture,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn register_scene_assets_tracks_scene_shader_texture_and_mesh_handles() {
+        let document = parse_scene_str(
+            r#"# nu scene format v1
+# .nuscene
+
+[scene]
+name = "asset_scene"
+syntax = vulkan
+
+[camera]
+position = 0.0, 0.0, 5.0
+target = 0.0, 0.0, 0.0
+fov = 60.0
+
+[light.key]
+type = point
+position = 0.0, 4.0, 4.0
+color = 1.0, 1.0, 1.0
+intensity = 1.0
+
+[mesh.crate]
+geometry = obj
+source = meshes/crate.obj
+material = red_material
+
+[material.red_material]
+shader.vertex = lit.vert
+shader.fragment = lit.frag
+albedo_texture = crate.png
+"#,
+        )
+        .expect("scene should parse");
+        let mut asset_manager = AssetManager::default();
+        let bindings = register_scene_assets(
+            &document,
+            Path::new("D:/3D/project/scenes/asset_scene.nuscene"),
+            &mut asset_manager,
+        );
+
+        assert_eq!(
+            asset_manager.get(bindings.scene).expect("scene asset").kind,
+            AssetKind::Scene
+        );
+        assert_eq!(
+            asset_manager
+                .get(bindings.shader_programs["red_material"].vertex)
+                .expect("vertex shader")
+                .kind,
+            AssetKind::Shader
+        );
+        assert_eq!(
+            asset_manager
+                .get(bindings.textures["red_material"])
+                .expect("texture")
+                .kind,
+            AssetKind::Texture
+        );
+        assert_eq!(
+            asset_manager
+                .get(bindings.meshes["crate"])
+                .expect("mesh")
+                .kind,
+            AssetKind::Mesh
         );
     }
 }

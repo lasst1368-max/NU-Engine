@@ -1,8 +1,10 @@
+mod asset;
 mod buffer;
 mod image;
 
 use std::collections::HashMap;
 
+pub use asset::{AssetHandle, AssetKind, AssetManager, AssetRecord, AssetState};
 pub use buffer::{BufferDesc, BufferHandle, BufferUsage};
 pub use image::{ImageDesc, ImageHandle, ImageUsage};
 

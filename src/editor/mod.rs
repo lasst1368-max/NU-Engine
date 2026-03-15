@@ -1,8 +1,9 @@
 use crate::engine::{
     EngineError, HotReloadManager, LightKind, NuCameraSection, NuEnvironmentSection,
-    NuLightSection, NuMaterialSection, NuMeshSection, NuSceneDocument, NuSceneMetadata,
-    NuSceneSection, NuTransform, ReloadBatch, SceneSyntax, load_scene_file,
+    NuLightSection, NuMaterialSection, NuMeshSection, NuPhysicsSection, NuSceneDocument,
+    NuSceneMetadata, NuSceneSection, NuTransform, ReloadBatch, SceneSyntax, load_scene_file,
 };
+use crate::lighting::ShadowMode;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,9 @@ impl SceneEditor {
                 environment: Some(NuEnvironmentSection {
                     ambient_color: [0.1, 0.1, 0.15],
                     ambient_intensity: 0.3,
+                    shadow_mode: ShadowMode::Live,
+                    shadow_max_distance: 32.0,
+                    shadow_filter_radius: 1.5,
                 }),
                 meshes: Default::default(),
                 materials: Default::default(),
@@ -97,10 +101,31 @@ impl SceneEditor {
     }
 
     pub fn set_environment(&mut self, ambient_color: [f32; 3], ambient_intensity: f32) {
-        self.document.environment = Some(NuEnvironmentSection {
-            ambient_color,
-            ambient_intensity,
-        });
+        let mut environment = self
+            .document
+            .environment
+            .clone()
+            .unwrap_or(default_environment());
+        environment.ambient_color = ambient_color;
+        environment.ambient_intensity = ambient_intensity;
+        self.document.environment = Some(environment);
+    }
+
+    pub fn set_environment_shadows(
+        &mut self,
+        shadow_mode: ShadowMode,
+        shadow_max_distance: f32,
+        shadow_filter_radius: f32,
+    ) {
+        let mut environment = self
+            .document
+            .environment
+            .clone()
+            .unwrap_or(default_environment());
+        environment.shadow_mode = shadow_mode;
+        environment.shadow_max_distance = shadow_max_distance.max(1.0);
+        environment.shadow_filter_radius = shadow_filter_radius.max(0.5);
+        self.document.environment = Some(environment);
     }
 
     pub fn clear_environment(&mut self) {
@@ -114,6 +139,7 @@ impl SceneEditor {
         position: [f32; 3],
         color: [f32; 3],
         intensity: f32,
+        casts_shadow: bool,
     ) {
         let name = name.into();
         self.document.lights.insert(
@@ -124,6 +150,7 @@ impl SceneEditor {
                 position,
                 color,
                 intensity,
+                casts_shadow,
             },
         );
     }
@@ -140,6 +167,7 @@ impl SceneEditor {
         material: impl Into<String>,
         parent: Option<String>,
         transform: NuTransform,
+        physics: Option<NuPhysicsSection>,
     ) {
         let name = name.into();
         self.document.meshes.insert(
@@ -151,8 +179,27 @@ impl SceneEditor {
                 material: material.into(),
                 parent,
                 transform,
+                pivot_offset: [0.0, 0.0, 0.0],
+                physics,
+                script: None,
             },
         );
+    }
+
+    pub fn set_mesh_physics(
+        &mut self,
+        name: &str,
+        physics: Option<NuPhysicsSection>,
+    ) -> Result<(), EngineError> {
+        let mesh = self
+            .document
+            .meshes
+            .get_mut(name)
+            .ok_or_else(|| EngineError::InvalidScene {
+                reason: format!("mesh `{name}` does not exist"),
+            })?;
+        mesh.physics = physics;
+        Ok(())
     }
 
     pub fn set_mesh_transform(
@@ -200,6 +247,7 @@ impl SceneEditor {
         shader_fragment: impl Into<PathBuf>,
         color: [f32; 3],
         roughness: f32,
+        metallic: f32,
         albedo_texture: Option<PathBuf>,
     ) {
         let name = name.into();
@@ -211,6 +259,7 @@ impl SceneEditor {
                 shader_fragment: shader_fragment.into(),
                 color,
                 roughness,
+                metallic,
                 albedo_texture,
             },
         );
@@ -309,7 +358,11 @@ fn serialize_document(document: &NuSceneDocument) -> String {
         out.push_str(&format!("type = {}\n", serialize_light_kind(light.kind)));
         out.push_str(&format!("position = {}\n", format_vec3(light.position)));
         out.push_str(&format!("color = {}\n", format_vec3(light.color)));
-        out.push_str(&format!("intensity = {}\n\n", format_f32(light.intensity)));
+        out.push_str(&format!("intensity = {}\n", format_f32(light.intensity)));
+        if !light.casts_shadow {
+            out.push_str("casts_shadow = false\n");
+        }
+        out.push('\n');
     }
 
     if let Some(environment) = &document.environment {
@@ -319,8 +372,20 @@ fn serialize_document(document: &NuSceneDocument) -> String {
             format_vec3(environment.ambient_color)
         ));
         out.push_str(&format!(
-            "ambient_intensity = {}\n\n",
+            "ambient_intensity = {}\n",
             format_f32(environment.ambient_intensity)
+        ));
+        out.push_str(&format!(
+            "shadow_mode = {}\n",
+            serialize_shadow_mode(environment.shadow_mode)
+        ));
+        out.push_str(&format!(
+            "shadow_max_distance = {}\n",
+            format_f32(environment.shadow_max_distance)
+        ));
+        out.push_str(&format!(
+            "shadow_filter_radius = {}\n\n",
+            format_f32(environment.shadow_filter_radius)
         ));
     }
 
@@ -350,6 +415,35 @@ fn serialize_document(document: &NuSceneDocument) -> String {
             "transform.scale = {}\n\n",
             format_vec3(mesh.transform.scale)
         ));
+        if mesh.pivot_offset != [0.0, 0.0, 0.0] {
+            out.push_str(&format!(
+                "pivot.offset = {}\n",
+                format_vec3(mesh.pivot_offset)
+            ));
+        }
+        if let Some(physics) = &mesh.physics {
+            out.push_str(&format!(
+                "physics.body = {}\n",
+                serialize_physics_body(physics.body)
+            ));
+            out.push_str(&format!(
+                "physics.collider = {}\n",
+                serialize_physics_collider(physics.collider)
+            ));
+            out.push_str(&format!("physics.mass = {}\n\n", format_f32(physics.mass)));
+        }
+        if let Some(script) = &mesh.script {
+            if let Some(path) = &script.na_script {
+                out.push_str(&format!("script.na = {}\n", format_path(path)));
+            }
+            if let Some(path) = &script.cpp_script {
+                out.push_str(&format!("script.cpp = {}\n", format_path(path)));
+            }
+            if script.player_camera {
+                out.push_str("script.player_camera = true\n");
+            }
+            out.push('\n');
+        }
     }
 
     for material in document.materials.values() {
@@ -364,6 +458,7 @@ fn serialize_document(document: &NuSceneDocument) -> String {
         ));
         out.push_str(&format!("color = {}\n", format_vec3(material.color)));
         out.push_str(&format!("roughness = {}\n", format_f32(material.roughness)));
+        out.push_str(&format!("metallic = {}\n", format_f32(material.metallic)));
         if let Some(texture) = &material.albedo_texture {
             out.push_str(&format!("albedo_texture = {}\n", format_path(texture)));
         }
@@ -385,6 +480,40 @@ fn serialize_light_kind(kind: LightKind) -> &'static str {
     match kind {
         LightKind::Point => "point",
         LightKind::Directional => "directional",
+    }
+}
+
+fn serialize_physics_body(kind: crate::engine::NuPhysicsBodyKind) -> &'static str {
+    match kind {
+        crate::engine::NuPhysicsBodyKind::Static => "static",
+        crate::engine::NuPhysicsBodyKind::Dynamic => "dynamic",
+        crate::engine::NuPhysicsBodyKind::Kinematic => "kinematic",
+    }
+}
+
+fn serialize_physics_collider(kind: crate::engine::NuPhysicsColliderKind) -> &'static str {
+    match kind {
+        crate::engine::NuPhysicsColliderKind::Auto => "auto",
+        crate::engine::NuPhysicsColliderKind::Cuboid => "cuboid",
+        crate::engine::NuPhysicsColliderKind::Sphere => "sphere",
+        crate::engine::NuPhysicsColliderKind::Plane => "plane",
+    }
+}
+
+fn serialize_shadow_mode(mode: ShadowMode) -> &'static str {
+    match mode {
+        ShadowMode::Off => "off",
+        ShadowMode::Live => "live",
+    }
+}
+
+fn default_environment() -> NuEnvironmentSection {
+    NuEnvironmentSection {
+        ambient_color: [0.1, 0.1, 0.15],
+        ambient_intensity: 0.3,
+        shadow_mode: ShadowMode::Live,
+        shadow_max_distance: 32.0,
+        shadow_filter_radius: 1.5,
     }
 }
 
@@ -422,7 +551,8 @@ fn format_f32(value: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::parse_scene_str;
+    use crate::engine::{NuMeshScriptSection, parse_scene_str};
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -434,6 +564,7 @@ mod tests {
             [1.0, 2.0, 3.0],
             [1.0, 1.0, 1.0],
             1.0,
+            true,
         );
         editor.upsert_material(
             "red_material",
@@ -441,6 +572,7 @@ mod tests {
             "lit.frag",
             [1.0, 0.0, 0.0],
             0.5,
+            0.0,
             Some(PathBuf::from("crate.png")),
         );
         editor.upsert_mesh(
@@ -454,11 +586,15 @@ mod tests {
                 rotation_degrees: [90.0, 0.0, 0.0],
                 scale: [1.0, 1.0, 1.0],
             },
+            None,
         );
 
         let scene_text = editor.to_nuscene_string();
         assert!(scene_text.contains("transform.rotation_radians = 1.570796"));
         assert!(!scene_text.contains("transform.rotation_degrees"));
+        assert!(scene_text.contains("shadow_mode = live"));
+        assert!(scene_text.contains("shadow_max_distance = 32.0"));
+        assert!(scene_text.contains("shadow_filter_radius = 1.5"));
     }
 
     #[test]
@@ -477,6 +613,7 @@ mod tests {
             [0.0, 4.0, 4.0],
             [1.0, 1.0, 1.0],
             1.0,
+            true,
         );
         editor.upsert_material(
             "red_material",
@@ -484,6 +621,7 @@ mod tests {
             "lit.frag",
             [1.0, 0.0, 0.0],
             0.5,
+            0.0,
             None,
         );
         editor.upsert_mesh(
@@ -497,6 +635,7 @@ mod tests {
                 rotation_degrees: [45.0, 30.0, 15.0],
                 scale: [1.0, 1.0, 1.0],
             },
+            None,
         );
         editor
             .save_as(&temp_path)
@@ -510,6 +649,167 @@ mod tests {
 
         let serialized = fs::read_to_string(&temp_path).expect("saved file should exist");
         assert!(serialized.contains("transform.rotation_radians = 0.785398, 0.523599, 0.261799"));
+        assert!(parse_scene_str(&serialized).is_ok());
+
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn editor_save_round_trips_mesh_pivot_offset() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let temp_path =
+            std::env::temp_dir().join(format!("nu_editor_pivot_roundtrip_{unique}.nuscene"));
+
+        let mut editor = SceneEditor::new_empty("pivot_roundtrip");
+        editor.upsert_light(
+            "key",
+            LightKind::Point,
+            [0.0, 4.0, 4.0],
+            [1.0, 1.0, 1.0],
+            1.0,
+            true,
+        );
+        editor.upsert_material(
+            "red_material",
+            "lit.vert",
+            "lit.frag",
+            [1.0, 0.0, 0.0],
+            0.5,
+            0.0,
+            None,
+        );
+        editor.upsert_mesh(
+            "cube",
+            "cube",
+            None,
+            "red_material",
+            None,
+            NuTransform::default(),
+            None,
+        );
+        editor
+            .document_mut()
+            .meshes
+            .get_mut("cube")
+            .expect("cube should exist")
+            .pivot_offset = [1.25, -0.5, 0.75];
+        editor
+            .save_as(&temp_path)
+            .expect("editor should save a scene file");
+
+        let reloaded = load_scene_file(&temp_path).expect("saved scene should parse");
+        assert_eq!(reloaded.meshes["cube"].pivot_offset, [1.25, -0.5, 0.75]);
+
+        let serialized = fs::read_to_string(&temp_path).expect("saved file should exist");
+        assert!(serialized.contains("pivot.offset = 1.25, -0.5, 0.75"));
+        assert!(parse_scene_str(&serialized).is_ok());
+
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn editor_save_round_trips_mesh_scripts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let temp_path =
+            std::env::temp_dir().join(format!("nu_editor_script_roundtrip_{unique}.nuscene"));
+
+        let mut editor = SceneEditor::new_empty("script_roundtrip");
+        editor.upsert_light(
+            "key",
+            LightKind::Point,
+            [0.0, 4.0, 4.0],
+            [1.0, 1.0, 1.0],
+            1.0,
+            true,
+        );
+        editor.upsert_material(
+            "red_material",
+            "lit.vert",
+            "lit.frag",
+            [1.0, 0.0, 0.0],
+            0.5,
+            0.0,
+            None,
+        );
+        editor.upsert_mesh(
+            "car",
+            "cube",
+            None,
+            "red_material",
+            None,
+            NuTransform::default(),
+            None,
+        );
+        editor
+            .document_mut()
+            .meshes
+            .get_mut("car")
+            .expect("car should exist")
+            .script = Some(NuMeshScriptSection {
+            na_script: Some(PathBuf::from("scripts/player_controller.na")),
+            cpp_script: Some(PathBuf::from("scripts/player_controller.cpp")),
+            player_camera: true,
+        });
+        editor
+            .save_as(&temp_path)
+            .expect("editor should save a scene file");
+
+        let reloaded = load_scene_file(&temp_path).expect("saved scene should parse");
+        let script = reloaded.meshes["car"]
+            .script
+            .as_ref()
+            .expect("script should persist");
+        assert_eq!(
+            script.na_script.as_deref(),
+            Some(Path::new("scripts/player_controller.na"))
+        );
+        assert_eq!(
+            script.cpp_script.as_deref(),
+            Some(Path::new("scripts/player_controller.cpp"))
+        );
+        assert!(script.player_camera);
+
+        let serialized = fs::read_to_string(&temp_path).expect("saved file should exist");
+        assert!(serialized.contains("script.na = scripts/player_controller.na"));
+        assert!(serialized.contains("script.cpp = scripts/player_controller.cpp"));
+        assert!(serialized.contains("script.player_camera = true"));
+
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn editor_save_round_trips_light_shadow_toggle() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let temp_path =
+            std::env::temp_dir().join(format!("nu_editor_light_shadow_roundtrip_{unique}.nuscene"));
+
+        let mut editor = SceneEditor::new_empty("light_shadow_roundtrip");
+        editor.upsert_light(
+            "key",
+            LightKind::Directional,
+            [0.0, 4.0, 4.0],
+            [1.0, 0.95, 0.9],
+            1.0,
+            false,
+        );
+        editor
+            .save_as(&temp_path)
+            .expect("editor should save a scene file");
+
+        let reloaded = load_scene_file(&temp_path).expect("saved scene should parse");
+        assert!(!reloaded.lights["key"].casts_shadow);
+
+        let serialized = fs::read_to_string(&temp_path).expect("saved file should exist");
+        assert!(serialized.contains("casts_shadow = false"));
         assert!(parse_scene_str(&serialized).is_ok());
 
         let _ = fs::remove_file(temp_path);

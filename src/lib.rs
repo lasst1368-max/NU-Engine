@@ -1,39 +1,61 @@
 pub mod app;
+pub mod backend;
 pub mod core;
 pub mod demo;
 pub mod editor;
 pub mod engine;
+pub mod event;
 pub mod executor;
+pub mod ffi;
 pub mod graphics;
 pub mod lighting;
 pub mod physics;
 pub mod pipeline;
 pub mod renderer;
 pub mod resource;
+pub mod rhi;
 pub mod runtime;
 pub mod scene;
+pub mod script;
 pub mod syntax;
 
 pub use api_macros::use_backend;
 use ash::vk;
-use core::{ApiConfig, ApiError, VulkanContext, VulkanContextBuilder};
+use core::{VulkanContext, VulkanContextBuilder};
 use pipeline::PipelineLibrary;
 use renderer::{FrameContext, FramePacket, Renderer2D, Renderer3D};
 use resource::ResourceRegistry;
 
 pub use app::{WindowApp, WindowConfig, run_window_app};
-pub use demo::{run_spinning_block_demo, run_square_demo};
+pub use backend::{
+    ALL_BACKEND_INFO, BackendInfo, DX12_BACKEND_INFO, GraphicsBackendKind, METAL_BACKEND_INFO,
+    VULKAN_BACKEND_INFO, backend_count, backend_info,
+};
+pub use core::{ApiConfig, ApiError};
+pub use demo::{run_physics_demo, run_spinning_block_demo, run_square_demo};
 pub use editor::{
     SceneEditor,
     ui::{EditorUiError, run_basic_scene_editor},
 };
+pub use engine::world::{
+    CameraComponent, EntityId, LightComponent, MeshRendererComponent, NuSceneWorld,
+    PhysicsBodyComponent, SceneEntity, TransformComponent,
+};
 pub use engine::{
     EXPLICIT_NUSCENE_TEMPLATE, EngineError, HotReloadManager, LightKind, NU_SCENE_EXTENSION,
     NU_SCENE_FORMAT_HEADER, NuCameraSection, NuEnvironmentSection, NuLightSection,
-    NuMaterialSection, NuMeshSection, NuSceneDocument, NuSceneMetadata, NuSceneSection,
-    NuTransform, ReloadBatch, ReloadedShader, ReloadedTexture, SceneAssetReferences, SceneBackend,
-    SceneSyntax, ShaderProgramPaths, ShaderStage, load_obj_mesh_asset, load_scene_file,
-    parse_scene_str,
+    NuMaterialSection, NuMeshScriptSection, NuMeshSection, NuPhysicsBodyKind,
+    NuPhysicsColliderKind, NuPhysicsSection, NuSceneDocument, NuSceneMetadata,
+    NuScenePhysicsBinding, NuScenePhysicsRuntime, NuSceneSection, NuTransform, ReloadBatch,
+    ReloadedShader, ReloadedTexture, SceneAssetBindings, SceneAssetReferences, SceneBackend,
+    SceneSyntax, ShaderProgramAssetHandles, ShaderProgramPaths, ShaderStage,
+    build_scene_physics_runtime, build_scene_physics_runtime_with_config, build_scene_world,
+    load_obj_mesh_asset, load_scene_file, parse_scene_str, publish_reload_batch_events,
+    register_scene_assets,
+};
+pub use event::{
+    EngineEvent, EventBus, EventCategoryMask, EventDeliveryMode, EventListenerHandle,
+    EventSubscription, ResourceEventKind,
 };
 pub use executor::{
     BufferBinding, DeferredAction, DescriptorSetBinding, DescriptorSetLayoutBindings,
@@ -44,10 +66,32 @@ pub use executor::{
     UniformValueKind, VertexAttributeBinding, VulkanExecutor, VulkanGraphicsPipelineCompiler,
     apply_descriptor_writes, resolve_descriptor_writes_for_bindings,
 };
-pub use lighting::{DirectionalLight, LightingConfig, PointLight, ShadowConfig};
+pub use lighting::{
+    DirectionalLight, LightingConfig, LiveShadowConfig, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS,
+    PointLight, ShadowConfig, ShadowMode, SpotLight,
+};
 pub use physics::{
     BodyHandle, BodyType, ColliderShape, CollisionContact, PhysicsConfig, PhysicsMaterial,
     PhysicsWorld, RigidBody, detect_collision,
+};
+pub use resource::{
+    AssetHandle, AssetKind, AssetManager, AssetRecord, AssetState, BufferDesc, BufferHandle,
+    BufferUsage, ImageDesc, ImageHandle, ImageUsage,
+};
+pub use rhi::vulkan::{
+    VulkanRhiBuffer, VulkanRhiCommandRecorder, VulkanRhiDevice, VulkanRhiDriver,
+    VulkanRhiGraphicsPipeline, VulkanRhiSurface, VulkanRhiTexture,
+};
+pub use rhi::{
+    AdapterPreference, BufferDesc as RhiBufferDesc, BufferInfo as RhiBufferInfo,
+    BufferUsage as RhiBufferUsage, DRIVER_CATALOG, DeviceRequest, Driver, DriverApi, DriverBuffer,
+    DriverCommandRecorder, DriverDescriptor, DriverDevice, DriverError, DriverGraphicsPipeline,
+    DriverSurface, DriverTexture, GraphicsPipelineDesc,
+    GraphicsPipelineInfo as RhiGraphicsPipelineInfo, PresentMode, PrimitiveTopology,
+    ShaderStage as RhiShaderStage, SurfaceConfig, TextureDesc as RhiTextureDesc, TextureFormat,
+    TextureInfo as RhiTextureInfo, VertexAttributeDesc as RhiVertexAttributeDesc,
+    VertexBindingDesc as RhiVertexBindingDesc, VertexFormat as RhiVertexFormat,
+    VertexInputRate as RhiVertexInputRate, driver_catalog,
 };
 pub use runtime::{
     SampledTextureDescriptorResources, create_sampled_texture_descriptor_resources,
@@ -55,10 +99,16 @@ pub use runtime::{
     resolve_sampled_texture_descriptor_writes, run_scene, update_sampled_texture_descriptor,
 };
 pub use scene::{
-    Camera2D, Camera3D, Canvas2D, CircleDraw, CubeDraw3D, DrawSpace, LineDraw, Mesh3D, MeshAsset3D,
-    MeshDraw3D, MeshMaterial3D, MeshVertex3D, PrimitiveDraw, QuadDraw, RectDraw, Scene,
-    SceneConfig, SceneFrame, ShapeStyle, SphereDraw3D, SquareDraw, TextAnchor, TextDraw,
+    Camera2D, Camera3D, Canvas2D, CircleDraw, CubeDraw3D, DrawSpace, Frustum, LineDraw, Mesh3D,
+    MeshAsset3D, MeshDraw3D, MeshMaterial3D, MeshVertex3D, PrimitiveDraw, QuadDraw, RectDraw,
+    Scene, SceneConfig, SceneFrame, ScreenshotResolution, ShapeStyle, SphereDraw3D, SquareDraw,
+    TextAnchor, TextDraw,
 };
+pub use scene::primitives::{
+    generate_capsule, generate_cone, generate_cylinder, generate_icosphere, generate_torus,
+};
+pub use scene::sculpt::{BrushFalloff, BrushMode, SculptBrush, SculptMesh};
+pub use script::{NaMoveBinding, NaMoveDirection, NaScriptProgram, parse_na_script};
 pub mod prelude {
     pub use crate::syntax::opengl::*;
 }

@@ -49,6 +49,13 @@ fn main() {
     compile_shader(
         &mut compiler,
         &options,
+        &shader_dir.join("shadow_3d.vert"),
+        shaderc::ShaderKind::Vertex,
+        &out_dir.join("shadow_3d.vert.spv"),
+    );
+    compile_shader(
+        &mut compiler,
+        &options,
         &shader_dir.join("text_2d.vert"),
         shaderc::ShaderKind::Vertex,
         &out_dir.join("text_2d.vert.spv"),

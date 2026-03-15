@@ -1,0 +1,4 @@
+nu C++ OpenGL-syntax scratch sample
+recorded commands: 28
+minecraft-style block: grass top, dirt bottom, grass side atlas layout
+vao=1 vbo=2 ebo=3 atlas=4
