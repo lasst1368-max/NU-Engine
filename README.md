@@ -28,7 +28,7 @@ Not to be confused with [Nu By bryanedds](https://github.com/bryanedds/Nu).
   <img src="screenshots/nu_spinning_cube_1773486819.png" alt="NU Engine — spinning cube, front view with point light glow" width="49%" />
 </p>
 
-*Spinning block demo: PBR lighting, PCF soft shadows, point light with emissive glow, and a live orbit camera — all running on the Vulkan backend.*
+*Spinning block demo: PBR lighting, PCF soft shadows, point light with emissive glow — all running on the Vulkan backend.*
 
 ---
 
